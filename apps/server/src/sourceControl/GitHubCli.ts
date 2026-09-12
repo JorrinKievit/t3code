@@ -492,6 +492,10 @@ export const make = Effect.gen(function* () {
           "search",
           "repos",
           input.query,
+          // Unscoped, GitHub also scores description and readme hits, and the caller reads the
+          // results as repository names: a description match can resolve as the sole near match.
+          "--match",
+          "name",
           "--limit",
           String(input.limit ?? 20),
           "--json",

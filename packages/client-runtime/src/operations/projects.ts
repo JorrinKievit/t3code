@@ -196,7 +196,10 @@ export function buildAddProjectRemoteSourceReadiness(
       readiness.set(provider.id, { ready: false, hint: provider.installHint });
       continue;
     }
-    if (provider.auth.status === "unauthenticated") {
+    // Anything short of `authenticated` — including the `unknown` a CLI too old to report its
+    // sign-in status answers with — cannot clone, so offering it as ready sends the user into a
+    // failure the row already knows about.
+    if (provider.auth.status !== "authenticated") {
       readiness.set(provider.id, {
         ready: false,
         hint:

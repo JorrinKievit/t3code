@@ -85,6 +85,7 @@ export function changeRequestUrlFor(
 ): string | null {
   switch (kind) {
     case "github":
+    case "github-enterprise":
       return `https://${host}/${repository}/pull/${number}`;
     case "gitlab":
       return `https://${host}/${repository}/-/merge_requests/${number}`;

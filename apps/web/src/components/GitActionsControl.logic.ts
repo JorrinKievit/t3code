@@ -445,7 +445,8 @@ export function getPublishProviderReadiness(input: {
   if (discovered.status !== "available") {
     return { ready: false, hint: discovered.installHint };
   }
-  if (discovered.auth.status === "unauthenticated") {
+  // `unknown` is not a licence to publish: the CLI could not say whether it is signed in.
+  if (discovered.auth.status !== "authenticated") {
     return {
       ready: false,
       hint:

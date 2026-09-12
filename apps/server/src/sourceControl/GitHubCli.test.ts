@@ -383,7 +383,7 @@ describe("GitHubCli.layer", () => {
       expect(mockRun).toHaveBeenCalledWith({
         operation: "GitHubCli.execute",
         command: "gh",
-        args: ["search", "repos", "core", "--limit", "20", "--json", "fullName"],
+        args: ["search", "repos", "core", "--match", "name", "--limit", "20", "--json", "fullName"],
         cwd: "/repo",
         timeoutMs: 30_000,
       });

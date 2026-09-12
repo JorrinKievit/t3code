@@ -1246,6 +1246,25 @@ describe("getPublishProviderReadiness", () => {
     );
   });
 
+  it("refuses to publish to a host whose sign-in status the CLI could not report", () => {
+    assert.deepEqual(
+      getPublishProviderReadiness({
+        provider: "github",
+        sourceControlProviders: [
+          discoveryItem({
+            kind: "github",
+            id: "github",
+            host: "github.com",
+            label: "GitHub",
+            authStatus: "unknown",
+            authDetail: "GitHub CLI is too old to report sign-in status.",
+          }),
+        ],
+      }),
+      { ready: false, hint: "GitHub CLI is too old to report sign-in status." },
+    );
+  });
+
   it("reports an unauthenticated enterprise host as not ready", () => {
     const readiness = getPublishProviderReadiness({
       provider: "github-enterprise",

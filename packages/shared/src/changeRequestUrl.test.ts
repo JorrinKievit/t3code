@@ -139,6 +139,16 @@ describe("siblingPullRequestUrl", () => {
 });
 
 describe("changeRequestUrlFor", () => {
+  it("writes an Enterprise pull request URL on the host it belongs to", () => {
+    const url = changeRequestUrlFor("github-enterprise", "git.corp.test", "platform/api", 7);
+    expect(url).toBe("https://git.corp.test/platform/api/pull/7");
+    expect(parseChangeRequestUrl(url!)).toEqual({
+      host: "git.corp.test",
+      repository: "platform/api",
+      number: 7,
+    });
+  });
+
   it.each([
     ["ssh.dev.azure.com", "v3/org/project/web"],
     ["vs-ssh.visualstudio.com", "v3/org/project/web"],

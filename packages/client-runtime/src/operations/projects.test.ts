@@ -247,6 +247,24 @@ describe("add project shared logic", () => {
     expect(sortAddProjectProviderSources(readiness, targets)[0]!.id).toBe("github");
   });
 
+  it("holds back a provider whose sign-in status the CLI could not report", () => {
+    const discovery = discoveryResult([
+      providerItem({
+        kind: "github",
+        id: "github",
+        host: "github.com",
+        label: "GitHub",
+        installHint: "Install gh",
+        auth: { status: "unknown", detail: "GitHub CLI is too old to report sign-in status." },
+      }),
+    ]);
+
+    expect(buildAddProjectRemoteSourceReadiness(discovery).get("github")).toEqual({
+      ready: false,
+      hint: "GitHub CLI is too old to report sign-in status.",
+    });
+  });
+
   it("finds existing projects by normalized path in the target environment", () => {
     const env = EnvironmentId.make("env");
     const other = EnvironmentId.make("other");
