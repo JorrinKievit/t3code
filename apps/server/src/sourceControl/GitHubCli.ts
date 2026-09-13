@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
+import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
@@ -21,6 +22,40 @@ import {
 } from "./gitHubPullRequests.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+/** Server-local credential scope; never put its value in RPC payloads or cache keys. */
+export const PinnedGitHubCredential = Context.Reference<{
+  readonly host: string;
+  readonly token: Redacted.Redacted<string>;
+  readonly credentialFingerprint: string;
+} | null>("t3/sourceControl/PinnedGitHubCredential", { defaultValue: () => null });
+
+function targetsVerifiedHost(args: ReadonlyArray<string>, host: string): boolean {
+  const hosts: Array<string | null> = [];
+  const repositoryHost = (repository: string | undefined) => {
+    if (repository === undefined) return null;
+    if (/^https?:\/\//i.test(repository)) {
+      try {
+        return new URL(repository).host.toLowerCase();
+      } catch {
+        return null;
+      }
+    }
+    const parts = repository.split("/");
+    return parts.length === 3 ? parts[0]!.toLowerCase() : null;
+  };
+  if (args[0] === "repo" && args[1] === "view") hosts.push(repositoryHost(args[2]));
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === "--hostname") hosts.push(args[++index]?.toLowerCase() ?? null);
+    else if (arg.startsWith("--hostname=")) hosts.push(arg.slice(11).toLowerCase());
+    else if (arg === "--repo" || arg === "-R") hosts.push(repositoryHost(args[++index]));
+    else if (arg.startsWith("--repo=")) hosts.push(repositoryHost(arg.slice(7)));
+    else if (arg.startsWith("-R")) hosts.push(repositoryHost(arg.slice(2)));
+    else if (/^https?:\/\//i.test(arg)) hosts.push(repositoryHost(arg));
+  }
+  return hosts.length > 0 && hosts.every((target) => target === host);
+}
 
 const gitHubCliFailureFields = {
   command: Schema.Literal("gh"),
@@ -256,6 +291,7 @@ export class GitHubCli extends Context.Service<
       readonly host?: string;
       /** Piped to the child's stdin, for payloads that must never appear in argv. */
       readonly stdin?: string;
+      readonly env?: NodeJS.ProcessEnv;
       readonly maxOutputBytes?: number;
     }) => Effect.Effect<VcsProcess.VcsProcessOutput, GitHubCliError>;
 
@@ -379,21 +415,48 @@ function deriveRepositoryCloneUrlsFromCreateOutput(
 export const make = Effect.gen(function* () {
   const process = yield* VcsProcess.VcsProcess;
 
-  const execute: GitHubCli["Service"]["execute"] = (input) =>
-    process
-      .run({
-        operation: "GitHubCli.execute",
-        command: "gh",
-        args: input.args,
-        cwd: input.cwd,
-        // `extendEnv` follows `env` down in the runner, so the host environment is merged in and
-        // this is the override alone.
-        ...(input.host ? { env: { GH_HOST: input.host } } : {}),
-        timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        ...(input.stdin !== undefined ? { stdin: input.stdin } : {}),
-        ...(input.maxOutputBytes !== undefined ? { maxOutputBytes: input.maxOutputBytes } : {}),
-      })
-      .pipe(Effect.mapError((error) => fromVcsError({ command: "gh", cwd: input.cwd }, error)));
+  const execute: GitHubCli["Service"]["execute"] = Effect.fn("GitHubCli.execute")(
+    function* (input) {
+      const credential = yield* PinnedGitHubCredential;
+      if (credential !== null && !targetsVerifiedHost(input.args, credential.host)) {
+        return yield* new GitHubCliCommandError({
+          command: "gh",
+          cwd: input.cwd,
+          cause: new Error("The GitHub command does not target the verified credential's host."),
+        });
+      }
+      const token = credential === null ? undefined : Redacted.value(credential.token);
+      // `extendEnv` follows `env` down in the runner, so the host environment is merged in and
+      // these are the overrides alone. A pinned credential names its own host and outranks the
+      // caller's, since the command has already been checked against it.
+      const env =
+        credential === null
+          ? input.host
+            ? { ...input.env, GH_HOST: input.host }
+            : input.env
+          : {
+              ...input.env,
+              GH_HOST: credential.host,
+              GH_TOKEN: token,
+              GITHUB_TOKEN: token,
+              GH_ENTERPRISE_TOKEN: token,
+              GITHUB_ENTERPRISE_TOKEN: token,
+              GH_DEBUG: "",
+            };
+      return yield* process
+        .run({
+          operation: "GitHubCli.execute",
+          command: "gh",
+          args: input.args,
+          cwd: input.cwd,
+          timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+          ...(input.stdin !== undefined ? { stdin: input.stdin } : {}),
+          ...(env !== undefined ? { env } : {}),
+          ...(input.maxOutputBytes !== undefined ? { maxOutputBytes: input.maxOutputBytes } : {}),
+        })
+        .pipe(Effect.mapError((error) => fromVcsError({ command: "gh", cwd: input.cwd }, error)));
+    },
+  );
 
   return GitHubCli.of({
     execute,

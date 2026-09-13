@@ -38,7 +38,13 @@ import {
   GlobeIcon,
 } from "lucide-react";
 import { Radio as RadioPrimitive } from "@base-ui/react/radio";
-import { AzureDevOpsIcon, BitbucketIcon, GitHubIcon, GitLabIcon } from "~/components/Icons";
+import {
+  AzureDevOpsIcon,
+  BitbucketIcon,
+  GitHubIcon,
+  GitLabIcon,
+  ForgejoIcon,
+} from "~/components/Icons";
 import { RadioGroup } from "~/components/ui/radio-group";
 import { Spinner } from "~/components/ui/spinner";
 import { toggleVariants } from "~/components/ui/toggle";
@@ -124,7 +130,7 @@ interface PendingDefaultBranchAction {
 
 type PublishProviderKind = Extract<
   SourceControlProviderKind,
-  "github" | "gitlab" | "bitbucket" | "azure-devops" | "github-enterprise"
+  "github" | "github-enterprise" | "gitlab" | "forgejo" | "bitbucket" | "azure-devops"
 >;
 
 type GitActionToastId = ReturnType<typeof toastManager.add>;
@@ -182,6 +188,15 @@ interface PublishProviderOption {
 }
 
 const PUBLISH_PROVIDER_OPTIONS = [
+  {
+    id: "forgejo",
+    value: "forgejo",
+    label: "Forgejo / Gitea",
+    description: "Your signed-in server",
+    host: "your server",
+    pathPlaceholder: "owner/repo",
+    Icon: ForgejoIcon,
+  },
   {
     id: "github",
     value: "github",
@@ -459,6 +474,7 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
     const accounts: Record<StaticPublishProviderKind, string | null> = {
       github: null,
       gitlab: null,
+      forgejo: null,
       bitbucket: null,
       "azure-devops": null,
     };
@@ -521,7 +537,16 @@ function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
         ? `${publishAccountByProvider[publishProvider]}/`
         : "";
   const publishRepository = publishRepositoryOverride ?? publishRepositoryPrefill;
-  const publishHost = currentPublishProvider.host;
+  // Forgejo's host is whichever server the CLI is signed into, so the card's placeholder only
+  // stands in until discovery answers.
+  const publishHost =
+    publishProvider === "forgejo"
+      ? (Option.getOrNull(
+          sourceControlDiscovery.data?.sourceControlProviders.find(
+            (provider) => provider.kind === "forgejo",
+          )?.auth.host ?? Option.none(),
+        ) ?? currentPublishProvider.host)
+      : currentPublishProvider.host;
   const publishPathPlaceholder = currentPublishProvider.pathPlaceholder;
   const publishProviderLabel = currentPublishProvider.label;
   const publishWizardSteps = ["Provider", "Repository", "Summary"] as const;

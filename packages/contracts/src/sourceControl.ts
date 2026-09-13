@@ -6,6 +6,7 @@ export const SourceControlProviderKind = Schema.Literals([
   "github",
   "github-enterprise",
   "gitlab",
+  "forgejo",
   "azure-devops",
   "bitbucket",
   "unknown",

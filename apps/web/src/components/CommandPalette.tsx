@@ -157,7 +157,7 @@ import { orderItemsByPreferredIds, sortLogicalProjectsForSidebar } from "./Sideb
 import { resolveEnvironmentOptionLabel } from "./BranchToolbar.logic";
 import { CommandPaletteContent } from "./CommandPaletteContent";
 import { CommandPaletteResults } from "./CommandPaletteResults";
-import { AzureDevOpsIcon, BitbucketIcon, GitHubIcon, GitLabIcon } from "./Icons";
+import { AzureDevOpsIcon, BitbucketIcon, GitHubIcon, GitLabIcon, ForgejoIcon } from "./Icons";
 import { EnvironmentMachineIcon } from "./EnvironmentMachineIcon";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { ProjectFilePicker } from "./files/ProjectFilePicker";
@@ -277,6 +277,8 @@ function remoteProjectSourceIcon(source: AddProjectRemoteSource, className: stri
     case "github":
     case "github-enterprise":
       return <GitHubIcon className={className} />;
+    case "forgejo":
+      return <ForgejoIcon className={className} />;
     case "gitlab":
       return <GitLabIcon className={className} />;
     case "bitbucket":
@@ -1658,6 +1660,7 @@ function OpenCommandPaletteDialog(props: {
       "git",
       "github",
       "gitlab",
+      "forgejo",
       "bitbucket",
       "azure",
       "devops",

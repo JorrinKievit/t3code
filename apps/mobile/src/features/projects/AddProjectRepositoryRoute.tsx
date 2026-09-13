@@ -20,6 +20,7 @@ export function AddProjectRepositoryRoute({
     source === "github" ||
     source === "github-enterprise" ||
     source === "gitlab" ||
+    source === "forgejo" ||
     source === "bitbucket" ||
     source === "azure-devops"
       ? addProjectRemoteTargetLabel({ id: source, source, host: host ?? null })

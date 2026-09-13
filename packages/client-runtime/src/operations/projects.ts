@@ -25,7 +25,7 @@ import type { EnvironmentProject } from "../state/models.ts";
 
 export type AddProjectRemoteProviderKind = Extract<
   SourceControlProviderKind,
-  "github" | "github-enterprise" | "gitlab" | "bitbucket" | "azure-devops"
+  "github" | "github-enterprise" | "gitlab" | "forgejo" | "bitbucket" | "azure-devops"
 >;
 export type AddProjectRemoteSource = AddProjectRemoteProviderKind | "url";
 
@@ -67,6 +67,8 @@ export function addProjectRemoteSourceLabel(source: AddProjectRemoteSource): str
       return "GitHub";
     case "github-enterprise":
       return "GitHub Enterprise";
+    case "forgejo":
+      return "Forgejo / Gitea";
     case "gitlab":
       return "GitLab";
     case "bitbucket":
@@ -80,6 +82,7 @@ export function addProjectRemoteSourceLabel(source: AddProjectRemoteSource): str
 
 export function addProjectRemoteSourcePathHint(source: AddProjectRemoteSource): string {
   switch (source) {
+    case "forgejo":
     case "github":
       return "owner/repo";
     case "github-enterprise":
@@ -154,11 +157,13 @@ export function normalizePastedCloneUrl(input: string): string {
   return `https://github.com/${repository}`;
 }
 
-/** GitHub defaults to HTTPS; other providers retain their existing SSH default. */
+/** GitHub and Forgejo default to HTTPS; other providers retain their existing SSH default. */
 export function getDefaultCloneUrl(
   repository: Pick<SourceControlRepositoryInfo, "provider" | "url" | "sshUrl">,
 ): string {
-  return repository.provider === "github" || repository.provider === "github-enterprise"
+  return repository.provider === "github" ||
+    repository.provider === "github-enterprise" ||
+    repository.provider === "forgejo"
     ? repository.url
     : repository.sshUrl;
 }
