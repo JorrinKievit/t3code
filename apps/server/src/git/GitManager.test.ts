@@ -37,6 +37,10 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as GitHubSourceControlProvider from "../sourceControl/GitHubSourceControlProvider.ts";
 import * as GitLabSourceControlProvider from "../sourceControl/GitLabSourceControlProvider.ts";
+import {
+  ForgejoPullRequestSchema,
+  toForgejoChangeRequest,
+} from "../sourceControl/forgejoPullRequests.ts";
 import type { SourceControlProvider } from "../sourceControl/SourceControlProvider.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as ServerConfig from "../config.ts";
@@ -46,6 +50,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as GitManager from "./GitManager.ts";
 
 const encodeCliJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeForgejoPullRequest = Schema.decodeEffect(ForgejoPullRequestSchema);
 
 interface FakeGhScenario {
   prListSequence?: string[];
@@ -579,6 +584,14 @@ function createGitHubCliWithFakeGh(scenario: FakeGhScenario = {}): {
             cause: new Error(`Unexpected repository create: ${input.repository}`),
           }),
         ),
+      searchRepositories: (input) =>
+        Effect.fail(
+          new GitHubCli.GitHubCliCommandError({
+            command: "gh",
+            cwd: input.cwd,
+            cause: new Error(`Unexpected repository search: ${input.query}`),
+          }),
+        ),
       checkoutPullRequest: (input) =>
         execute({
           cwd: input.cwd,
@@ -630,6 +643,7 @@ function makeManager(input?: {
   textGeneration?: Partial<FakeGitTextGeneration>;
   serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   setupScriptRunner?: ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"];
+  providerKind?: "github" | "github-enterprise";
   gitConfigReads?: string[];
 }) {
   const { service: gitHubCli, ghCalls } = createGitHubCliWithFakeGh(input?.ghScenario);
@@ -667,11 +681,12 @@ function makeManager(input?: {
   const sourceControlRegistryLayer = Layer.effect(
     SourceControlProviderRegistry.SourceControlProviderRegistry,
     (input?.sourceControlProvider === undefined
-      ? GitHubSourceControlProvider.make
+      ? GitHubSourceControlProvider.makeProvider(input?.providerKind ?? "github")
       : Effect.succeed(input.sourceControlProvider)
     ).pipe(
       Effect.map((provider) =>
         SourceControlProviderRegistry.SourceControlProviderRegistry.of({
+          resolveLink: (input) => provider.resolveLink?.(input),
           get: () => Effect.succeed(provider),
           resolveHandle: () => Effect.succeed({ provider, context: null }),
           resolve: () => Effect.succeed(provider),
@@ -3851,6 +3866,69 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
     20_000,
   );
 
+  it.effect("matches mounted Forgejo heads without confusing forks sharing a branch", () =>
+    Effect.gen(function* () {
+      for (const owner of ["maria", "reviewer"]) {
+        const mapped = toForgejoChangeRequest(
+          yield* decodeForgejoPullRequest({
+            number: 42,
+            title: "Greeting",
+            html_url: "https://forgejo.example/forgejo/maria/project/pulls/42",
+            state: "open",
+            merged: false,
+            base: {
+              ref: "main",
+              sha: "base",
+              repo: { full_name: "maria/project", owner: { login: "maria" } },
+            },
+            head: {
+              ref: "greeting",
+              sha: "head",
+              repo: { full_name: `${owner}/project`, owner: { login: owner } },
+            },
+          }),
+        );
+        const pr = {
+          ...mapped,
+          isDraft: mapped.isDraft ?? false,
+          closedAt: mapped.closedAt ?? null,
+          mergedAt: mapped.mergedAt ?? null,
+        };
+        const repository = GitManager.parseRepositoryNameWithOwnerFromRemoteUrl(
+          `https://forgejo.example/forgejo/${owner}/project.git`,
+          "forgejo",
+        );
+        expect(repository).toBe(`${owner}/project`);
+        const context = {
+          headBranch: "greeting",
+          headRepositoryNameWithOwner: repository,
+          headRepositoryOwnerLogin: repository?.split("/")[0] ?? null,
+          isCrossRepository: owner !== "maria",
+        };
+        expect(GitManager.matchesBranchHeadContext(pr, context)).toBe(true);
+        expect(
+          GitManager.matchesBranchHeadContext(pr, {
+            ...context,
+            headRepositoryNameWithOwner: "other/project",
+            headRepositoryOwnerLogin: "other",
+          }),
+        ).toBe(false);
+      }
+      expect(
+        GitManager.parseRepositoryNameWithOwnerFromRemoteUrl(
+          "git@forgejo.example:maria/project.git",
+          "forgejo",
+        ),
+      ).toBe("maria/project");
+      expect(
+        GitManager.parseRepositoryNameWithOwnerFromRemoteUrl(
+          "https://gitlab.example/group/maria/project.git",
+          "gitlab",
+        ),
+      ).toBe("group/maria/project");
+    }),
+  );
+
   it.effect("rejects same-repo PR metadata when matching a cross-repo head context", () =>
     Effect.sync(() => {
       const headContext = {
@@ -3999,6 +4077,68 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         ghCalls.some((call) => call.includes("pr create --base main --head feature-create-pr")),
       ).toBe(true);
       expect(ghCalls.some((call) => call.startsWith("pr view "))).toBe(false);
+    }),
+  );
+
+  it.effect("feeds the pull request template to enterprise change requests too", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      NodeFS.mkdirSync(NodePath.join(repoDir, ".github"));
+      NodeFS.writeFileSync(
+        NodePath.join(repoDir, ".github", "pull_request_template.md"),
+        "## What changed?\n\n## Verification",
+      );
+      yield* runGit(repoDir, ["add", ".github/pull_request_template.md"]);
+      yield* runGit(repoDir, ["commit", "-m", "Add pull request template"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature-enterprise-template"]);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "changes.txt"), "change\n");
+      yield* runGit(repoDir, ["add", "changes.txt"]);
+      yield* runGit(repoDir, ["commit", "-m", "Feature commit"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature-enterprise-template"]);
+      yield* runGit(repoDir, [
+        "config",
+        "branch.feature-enterprise-template.gh-merge-base",
+        "main",
+      ]);
+      let generatedChangeRequestTemplate: string | undefined;
+
+      const { manager } = yield* makeManager({
+        providerKind: "github-enterprise",
+        textGeneration: {
+          generatePrContent: (input) => {
+            generatedChangeRequestTemplate = input.changeRequestTemplate;
+            return Effect.succeed({
+              title: "Add stacked git actions",
+              body: "## What changed?\nAdded stacked git actions.",
+            });
+          },
+        },
+        ghScenario: {
+          prListSequence: [
+            "[]",
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
+            JSON.stringify([
+              {
+                number: 12,
+                title: "Add stacked git actions",
+                url: "https://git.corp.com/owner/repo/pull/12",
+                baseRefName: "main",
+                headRefName: "feature-enterprise-template",
+              },
+            ]),
+          ],
+        },
+      });
+      const result = yield* runStackedAction(manager, {
+        cwd: repoDir,
+        action: "commit_push_pr",
+      });
+
+      expect(result.pr.status).toBe("created");
+      expect(generatedChangeRequestTemplate).toBe("## What changed?\n\n## Verification");
     }),
   );
 

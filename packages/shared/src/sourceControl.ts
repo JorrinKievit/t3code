@@ -5,7 +5,7 @@ import type {
 } from "@t3tools/contracts";
 
 export interface ChangeRequestPresentation {
-  readonly icon: "github" | "gitlab" | "azure-devops" | "bitbucket" | "change-request";
+  readonly icon: "github" | "gitlab" | "forgejo" | "azure-devops" | "bitbucket" | "change-request";
   readonly providerName: string;
   readonly shortName: string;
   readonly longName: string;
@@ -36,6 +36,17 @@ const GITHUB_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
   urlExample: "https://github.com/owner/repo/pull/42",
 };
 
+const GITHUB_ENTERPRISE_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
+  icon: "github",
+  providerName: "GitHub Enterprise",
+  shortName: "PR",
+  longName: "pull request",
+  pluralLongName: "pull requests",
+  providerLongName: "GitHub Enterprise pull request",
+  checkoutCommandExample: "gh pr checkout 123",
+  urlExample: "https://git.company.com/owner/repo/pull/42",
+};
+
 const GITLAB_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
   icon: "gitlab",
   providerName: "GitLab",
@@ -45,6 +56,17 @@ const GITLAB_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
   providerLongName: "GitLab merge request",
   checkoutCommandExample: "glab mr checkout 123",
   urlExample: "https://gitlab.com/group/project/-/merge_requests/42",
+};
+
+const FORGEJO_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
+  icon: "forgejo",
+  providerName: "Forgejo",
+  shortName: "PR",
+  longName: "pull request",
+  pluralLongName: "pull requests",
+  providerLongName: "Forgejo pull request",
+  checkoutCommandExample: "tea pr checkout 123",
+  urlExample: "https://codeberg.org/owner/repo/pulls/42",
 };
 
 const AZURE_DEVOPS_CHANGE_REQUEST_PRESENTATION: ChangeRequestPresentation = {
@@ -85,8 +107,12 @@ export function resolveChangeRequestPresentation(
     case "github":
     case undefined:
       return GITHUB_CHANGE_REQUEST_PRESENTATION;
+    case "github-enterprise":
+      return GITHUB_ENTERPRISE_CHANGE_REQUEST_PRESENTATION;
     case "gitlab":
       return GITLAB_CHANGE_REQUEST_PRESENTATION;
+    case "forgejo":
+      return FORGEJO_CHANGE_REQUEST_PRESENTATION;
     case "azure-devops":
       return AZURE_DEVOPS_CHANGE_REQUEST_PRESENTATION;
     case "bitbucket":
@@ -167,8 +193,13 @@ function hasDnsLabel(host: string, label: string): boolean {
   return host.split(".").includes(label);
 }
 
+/** Dotcom itself and the endpoints it serves elsewhere, such as `ssh.github.com` on port 443. */
 function isGitHubHost(host: string): boolean {
-  return host === "github.com" || hasDnsLabel(host, "github");
+  return host === "github.com" || host.endsWith(".github.com");
+}
+
+function isGitHubEnterpriseHost(host: string): boolean {
+  return !isGitHubHost(host) && (host.endsWith(".ghe.com") || hasDnsLabel(host, "github"));
 }
 
 function isGitLabHost(host: string): boolean {
@@ -200,10 +231,32 @@ export function detectSourceControlProviderFromRemoteUrl(
   }
   const hostname = parseHostName(host);
 
+  if (
+    hostname === "codeberg.org" ||
+    hasDnsLabel(hostname, "forgejo") ||
+    hasDnsLabel(hostname, "gitea")
+  ) {
+    return {
+      kind: "forgejo",
+      name: "Forgejo",
+      baseUrl: /^https?:/iu.test(remoteUrl.trim())
+        ? new URL(remoteUrl.trim()).origin
+        : toBaseUrl(host),
+    };
+  }
+
   if (isGitHubHost(hostname)) {
     return {
       kind: "github",
-      name: hostname === "github.com" ? "GitHub" : "GitHub Self-Hosted",
+      name: "GitHub",
+      baseUrl: toBaseUrl(host),
+    };
+  }
+
+  if (isGitHubEnterpriseHost(hostname)) {
+    return {
+      kind: "github-enterprise",
+      name: hostname,
       baseUrl: toBaseUrl(host),
     };
   }

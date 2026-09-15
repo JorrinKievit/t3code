@@ -1,12 +1,17 @@
 import { assert, it, afterEach, describe, expect, vi } from "@effect/vitest";
+import * as Cache from "effect/Cache";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as PlatformError from "effect/PlatformError";
+import * as Redacted from "effect/Redacted";
+import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { VcsProcessExitError, VcsProcessSpawnError } from "@t3tools/contracts";
 
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as GitHubCli from "./GitHubCli.ts";
+
+const encodeGitHubCliError = Schema.encodeEffect(Schema.fromJsonString(GitHubCli.GitHubCliError));
 
 const processOutput = (stdout: string): VcsProcess.VcsProcessOutput => ({
   exitCode: ChildProcessSpawner.ExitCode(0),
@@ -31,6 +36,111 @@ afterEach(() => {
 });
 
 describe("GitHubCli.layer", () => {
+  it.effect("pins concurrent cached commands to their own verified credentials", () =>
+    Effect.gen(function* () {
+      mockRun.mockImplementation((input) =>
+        Effect.succeed(processOutput(input.env?.GH_TOKEN ?? "ambient")),
+      );
+      const gh = yield* GitHubCli.GitHubCli;
+      // Constructed outside either request, like the PR service's read caches.
+      const cache = yield* Cache.make({
+        lookup: (host: string) =>
+          gh.execute({
+            cwd: "/repo",
+            args: ["api", "user", "--hostname", host],
+            env: { GH_DEBUG: "api", GH_TOKEN: "changed-after-verification" },
+          }),
+        capacity: 2,
+        timeToLive: "1 minute",
+      });
+      const results = yield* Effect.all(
+        ["github.com", "github.example.test"].map((host, index) =>
+          Cache.get(cache, host).pipe(
+            Effect.provideService(GitHubCli.PinnedGitHubCredential, {
+              host,
+              token: Redacted.make(`credential-${index}`),
+              credentialFingerprint: `fingerprint-${index}`,
+            }),
+          ),
+        ),
+        { concurrency: 2 },
+      );
+      expect(results.map((result) => result.stdout)).toEqual(["credential-0", "credential-1"]);
+      for (const [input] of mockRun.mock.calls) {
+        expect(input.env).toMatchObject({
+          GH_HOST: input.args[3],
+          GH_DEBUG: "",
+          GH_TOKEN: input.env?.GITHUB_TOKEN,
+          GH_ENTERPRISE_TOKEN: input.env?.GH_TOKEN,
+          GITHUB_ENTERPRISE_TOKEN: input.env?.GH_TOKEN,
+        });
+      }
+      expect((yield* gh.execute({ cwd: "/repo", args: ["api", "user"] })).stdout).toBe("ambient");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("refuses other or implicit hosts before exposing a scoped credential to gh", () =>
+    Effect.gen(function* () {
+      const gh = yield* GitHubCli.GitHubCli;
+      for (const args of [
+        ["api", "user", "--hostname", "other.example.test"],
+        ["api", "user", "--hostname=other.example.test"],
+        ["pr", "view", "1", "--repo", "other.example.test/owner/repo"],
+        ["repo", "view", "other.example.test/owner/repo", "--json", "name"],
+        ["api", "https://other.example.test/user", "--hostname", "github.com"],
+        ["api", "user"],
+      ]) {
+        const failure = yield* gh.execute({ cwd: "/repo", args }).pipe(
+          Effect.provideService(GitHubCli.PinnedGitHubCredential, {
+            host: "github.com",
+            token: Redacted.make("secret-credential"),
+            credentialFingerprint: "fingerprint",
+          }),
+          Effect.flip,
+        );
+        expect(failure._tag).toBe("GitHubCliCommandError");
+        expect(yield* encodeGitHubCliError(failure)).not.toContain("secret-credential");
+      }
+      expect(mockRun).not.toHaveBeenCalled();
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("pins repository-targeted writes on enterprise hosts", () =>
+    Effect.gen(function* () {
+      mockRun.mockReturnValue(Effect.succeed(processOutput("")));
+      const gh = yield* GitHubCli.GitHubCli;
+      yield* gh
+        .execute({
+          cwd: "/repo",
+          args: ["pr", "merge", "1", "--repo", "github.example.test/owner/repo"],
+        })
+        .pipe(
+          Effect.provideService(GitHubCli.PinnedGitHubCredential, {
+            host: "github.example.test",
+            token: Redacted.make("enterprise-credential"),
+            credentialFingerprint: "fingerprint",
+          }),
+        );
+      yield* gh
+        .execute({
+          cwd: "/repo",
+          args: ["repo", "view", "github.example.test/owner/repo", "--json", "name"],
+        })
+        .pipe(
+          Effect.provideService(GitHubCli.PinnedGitHubCredential, {
+            host: "github.example.test",
+            token: Redacted.make("enterprise-credential"),
+            credentialFingerprint: "fingerprint",
+          }),
+        );
+      expect(mockRun.mock.calls[0]?.[0].env).toMatchObject({
+        GH_HOST: "github.example.test",
+        GH_ENTERPRISE_TOKEN: "enterprise-credential",
+        GH_DEBUG: "",
+      });
+    }).pipe(Effect.provide(layer)),
+  );
+
   it("does not classify a missing cwd as an unavailable gh executable", () => {
     const context = { command: "gh", cwd: "/repo" } as const;
     const missingCwd = new VcsProcessSpawnError({
@@ -356,6 +466,62 @@ describe("GitHubCli.layer", () => {
     }).pipe(Effect.provide(layer)),
   );
 
+  it.effect("searches repositories and decodes full names", () =>
+    Effect.gen(function* () {
+      mockRun.mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
+            JSON.stringify([
+              { fullName: "Sollit/core-documentation" },
+              { fullName: "Sollit/core" },
+            ]),
+          ),
+        ),
+      );
+
+      const gh = yield* GitHubCli.GitHubCli;
+      const result = yield* gh.searchRepositories({
+        cwd: "/repo",
+        query: "core",
+      });
+
+      assert.deepStrictEqual(result, [
+        { fullName: "Sollit/core-documentation" },
+        { fullName: "Sollit/core" },
+      ]);
+      expect(mockRun).toHaveBeenCalledWith({
+        operation: "GitHubCli.execute",
+        command: "gh",
+        args: ["search", "repos", "core", "--match", "name", "--limit", "20", "--json", "fullName"],
+        cwd: "/repo",
+        timeoutMs: 30_000,
+      });
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("treats empty repository search output as no results", () =>
+    Effect.gen(function* () {
+      mockRun.mockReturnValueOnce(Effect.succeed(processOutput("")));
+
+      const gh = yield* GitHubCli.GitHubCli;
+      const result = yield* gh.searchRepositories({ cwd: "/repo", query: "core" });
+
+      assert.deepStrictEqual(result, []);
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("surfaces a decode error for invalid repository search JSON", () =>
+    Effect.gen(function* () {
+      mockRun.mockReturnValueOnce(Effect.succeed(processOutput("not json")));
+
+      const gh = yield* GitHubCli.GitHubCli;
+      const error = yield* gh.searchRepositories({ cwd: "/repo", query: "core" }).pipe(Effect.flip);
+
+      assert.strictEqual(error._tag, "GitHubRepositorySearchDecodeError");
+    }).pipe(Effect.provide(layer)),
+  );
+
   it.effect("surfaces a friendly error when the pull request is not found", () =>
     Effect.gen(function* () {
       const cause = new VcsProcessExitError({
@@ -413,6 +579,101 @@ describe("GitHubCli.layer", () => {
       assert.include(error.detail, "gh api rate_limit");
       assert.strictEqual(error.cause, cause);
       assert.notInclude(error.message, "user ID");
+    }).pipe(Effect.provide(layer)),
+  );
+});
+
+describe("GitHubCli host targeting", () => {
+  it.effect("sets GH_HOST when a host is supplied", () =>
+    Effect.gen(function* () {
+      mockRun.mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
+            JSON.stringify({
+              nameWithOwner: "owner/repo",
+              url: "https://git.corp.com/owner/repo",
+              sshUrl: "git@git.corp.com:owner/repo.git",
+            }),
+          ),
+        ),
+      );
+
+      const cli = yield* GitHubCli.GitHubCli;
+      yield* cli.getRepositoryCloneUrls({
+        cwd: "/repo",
+        repository: "owner/repo",
+        host: "git.corp.com",
+      });
+
+      expect(mockRun.mock.calls[0]![0].env?.GH_HOST).toBe("git.corp.com");
+      // The override alone: the runner extends the host environment wherever `env` is set, so
+      // copying it in here would only pin a snapshot of it.
+      expect(Object.keys(mockRun.mock.calls[0]![0].env ?? {})).toEqual(["GH_HOST"]);
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("omits env entirely when no host is supplied", () =>
+    Effect.gen(function* () {
+      mockRun.mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
+            JSON.stringify({
+              nameWithOwner: "owner/repo",
+              url: "https://github.com/owner/repo",
+              sshUrl: "git@github.com:owner/repo.git",
+            }),
+          ),
+        ),
+      );
+
+      const cli = yield* GitHubCli.GitHubCli;
+      yield* cli.getRepositoryCloneUrls({ cwd: "/repo", repository: "owner/repo" });
+
+      expect(mockRun.mock.calls[0]![0]).not.toHaveProperty("env");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("sets GH_HOST when searching repositories with a host", () =>
+    Effect.gen(function* () {
+      mockRun.mockReturnValueOnce(
+        Effect.succeed(
+          processOutput(
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
+            JSON.stringify([{ fullName: "Sollit/core" }]),
+          ),
+        ),
+      );
+
+      const cli = yield* GitHubCli.GitHubCli;
+      yield* cli.searchRepositories({
+        cwd: "/repo",
+        query: "core",
+        host: "sollit.ghe.com",
+      });
+
+      expect(mockRun.mock.calls[0]![0].env?.GH_HOST).toBe("sollit.ghe.com");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect("derives enterprise clone urls when repo create prints no url", () =>
+    Effect.gen(function* () {
+      mockRun.mockReturnValueOnce(Effect.succeed(processOutput("")));
+
+      const cli = yield* GitHubCli.GitHubCli;
+      const urls = yield* cli.createRepository({
+        cwd: "/repo",
+        repository: "owner/repo",
+        visibility: "private",
+        host: "git.corp.com",
+      });
+
+      expect(urls).toEqual({
+        nameWithOwner: "owner/repo",
+        url: "https://git.corp.com/owner/repo",
+        sshUrl: "git@git.corp.com:owner/repo.git",
+      });
     }).pipe(Effect.provide(layer)),
   );
 });

@@ -1,3 +1,4 @@
+import * as NodeUtil from "node:util";
 import type {
   SourceControlProviderAuth,
   SourceControlProviderDiscoveryItem,
@@ -28,16 +29,28 @@ interface SourceControlDiscoverySpecBase {
   readonly installHint: string;
 }
 
+export interface SourceControlDiscoveryInstance {
+  readonly kind: SourceControlProviderKind;
+  readonly id: string;
+  readonly host: string | null;
+  readonly label: string;
+  readonly auth: SourceControlProviderAuth;
+}
+
 export type SourceControlCliDiscoverySpec = SourceControlDiscoverySpecBase & {
   readonly type: "cli";
   readonly executable: string;
   readonly versionArgs: ReadonlyArray<string>;
   readonly authArgs: ReadonlyArray<string>;
+  readonly remoteRefinementArgs?: ReadonlyArray<string>;
   readonly probeTimeoutMs?: number;
   readonly parseAuth: (input: SourceControlAuthProbeInput) => SourceControlProviderAuth;
   readonly refineUnknownRemote?: (
     input: SourceControlUnknownRemoteRefinementInput,
   ) => SourceControlProviderInfo | null;
+  readonly expandInstances?: (
+    input: SourceControlAuthProbeInput,
+  ) => ReadonlyArray<SourceControlDiscoveryInstance>;
 };
 
 export type SourceControlApiDiscoverySpec = SourceControlDiscoverySpecBase & {
@@ -45,8 +58,18 @@ export type SourceControlApiDiscoverySpec = SourceControlDiscoverySpecBase & {
   readonly probeAuth: Effect.Effect<SourceControlProviderAuth, never>;
 };
 
+export type SourceControlManagedCliDiscoverySpec = SourceControlDiscoverySpecBase & {
+  readonly type: "managed-cli";
+  readonly probe: (cwd: string) => Effect.Effect<SourceControlProviderDiscoveryItem>;
+  readonly refineUnknownRemote: (input: {
+    readonly cwd: string;
+    readonly context: SourceControlProvider.SourceControlProviderContext;
+  }) => Effect.Effect<SourceControlProviderInfo | null>;
+};
+
 export type SourceControlProviderDiscoverySpec =
   | SourceControlCliDiscoverySpec
+  | SourceControlManagedCliDiscoverySpec
   | SourceControlApiDiscoverySpec;
 
 type SourceControlCliRemoteRefinementSpec = SourceControlCliDiscoverySpec & {
@@ -72,7 +95,7 @@ interface DiscoveryProbeResult {
 }
 
 export function firstNonEmptyLine(text: string): Option.Option<string> {
-  const line = text
+  const line = NodeUtil.stripVTControlCharacters(text)
     .split(/\r?\n/)
     .map((entry) => entry.trim())
     .find((entry) => entry.length > 0);
@@ -213,21 +236,26 @@ export function probeSourceControlProvider(input: {
   readonly spec: SourceControlProviderDiscoverySpec;
   readonly process: VcsProcess.VcsProcess["Service"];
   readonly cwd: string;
-}): Effect.Effect<SourceControlProviderDiscoveryItem> {
+}): Effect.Effect<ReadonlyArray<SourceControlProviderDiscoveryItem>> {
+  // A managed CLI probes itself and answers for one instance; only `gh` expands into several.
+  if (input.spec.type === "managed-cli") {
+    return Effect.map(input.spec.probe(input.cwd), (item) => [item]);
+  }
   if (input.spec.type === "api") {
     return input.spec.probeAuth.pipe(
-      Effect.map(
-        (auth) =>
-          ({
-            kind: input.spec.kind,
-            label: input.spec.label,
-            status: "available" as const,
-            version: Option.none<string>(),
-            installHint: input.spec.installHint,
-            detail: Option.none<string>(),
-            auth,
-          }) satisfies SourceControlProviderDiscoveryItem,
-      ),
+      Effect.map((auth) => [
+        {
+          kind: input.spec.kind,
+          id: input.spec.kind,
+          host: Option.none<string>(),
+          label: input.spec.label,
+          status: "available" as const,
+          version: Option.none<string>(),
+          installHint: input.spec.installHint,
+          detail: Option.none<string>(),
+          auth,
+        } satisfies SourceControlProviderDiscoveryItem,
+      ]),
     );
   }
 
@@ -240,10 +268,14 @@ export function probeSourceControlProvider(input: {
   }).pipe(
     Effect.flatMap((item) => {
       if (item.status !== "available") {
-        return Effect.succeed({
-          ...item,
-          auth: unknownAuth("Hosting integration command was not found on the server PATH."),
-        } satisfies SourceControlProviderDiscoveryItem);
+        return Effect.succeed([
+          {
+            ...item,
+            id: spec.kind,
+            host: Option.none<string>(),
+            auth: unknownAuth("Hosting integration command was not found on the server PATH."),
+          } satisfies SourceControlProviderDiscoveryItem,
+        ]);
       }
 
       return input.process
@@ -258,18 +290,40 @@ export function probeSourceControlProvider(input: {
           appendTruncationMarker: true,
         })
         .pipe(
-          Effect.map(
-            (result) =>
-              ({
+          Effect.map((result) => {
+            const instances = spec.expandInstances?.(result);
+            if (instances) {
+              return instances.map(
+                (instance) =>
+                  ({
+                    ...item,
+                    kind: instance.kind,
+                    id: instance.id,
+                    host:
+                      instance.host === null ? Option.none<string>() : Option.some(instance.host),
+                    label: instance.label,
+                    auth: instance.auth,
+                  }) satisfies SourceControlProviderDiscoveryItem,
+              );
+            }
+            return [
+              {
                 ...item,
+                id: spec.kind,
+                host: Option.none<string>(),
                 auth: spec.parseAuth(result),
-              }) satisfies SourceControlProviderDiscoveryItem,
-          ),
+              } satisfies SourceControlProviderDiscoveryItem,
+            ];
+          }),
           Effect.catch((cause) =>
-            Effect.succeed({
-              ...item,
-              auth: unknownAuth(Option.getOrUndefined(detailFromCause(cause))),
-            } satisfies SourceControlProviderDiscoveryItem),
+            Effect.succeed([
+              {
+                ...item,
+                id: spec.kind,
+                host: Option.none<string>(),
+                auth: unknownAuth(Option.getOrUndefined(detailFromCause(cause))),
+              } satisfies SourceControlProviderDiscoveryItem,
+            ]),
           ),
         );
     }),
@@ -288,12 +342,16 @@ export const refineUnknownRemoteProvider = Effect.fn("refineUnknownRemoteProvide
     }
     const context = input.context;
 
-    const providers = yield* Effect.forEach(input.specs.filter(isCliRemoteRefinementSpec), (spec) =>
-      input.process
+    const providers = yield* Effect.forEach(input.specs, (spec) => {
+      if (spec.type === "managed-cli") {
+        return spec.refineUnknownRemote({ cwd: input.cwd, context });
+      }
+      if (!isCliRemoteRefinementSpec(spec)) return Effect.succeed(null);
+      return input.process
         .run({
           operation: "source-control.discovery.refine-unknown-remote",
           command: spec.executable,
-          args: spec.authArgs,
+          args: spec.remoteRefinementArgs ?? spec.authArgs,
           cwd: input.cwd,
           allowNonZeroExit: true,
           timeoutMs: probeTimeoutMs(spec),
@@ -309,8 +367,8 @@ export const refineUnknownRemoteProvider = Effect.fn("refineUnknownRemoteProvide
             }),
           ),
           Effect.orElseSucceed(() => null),
-        ),
-    );
+        );
+    });
     const provider = providers.find((candidate) => candidate !== null);
 
     return provider ? { ...context, provider } : context;

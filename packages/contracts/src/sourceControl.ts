@@ -4,7 +4,9 @@ import { VcsDriverKind } from "./vcs.ts";
 
 export const SourceControlProviderKind = Schema.Literals([
   "github",
+  "github-enterprise",
   "gitlab",
+  "forgejo",
   "azure-devops",
   "bitbucket",
   "unknown",
@@ -64,6 +66,7 @@ export type SourceControlRepositoryInfo = typeof SourceControlRepositoryInfo.Typ
 export const SourceControlRepositoryLookupInput = Schema.Struct({
   provider: SourceControlProviderKind,
   repository: TrimmedNonEmptyString,
+  host: Schema.optional(TrimmedNonEmptyString),
   cwd: Schema.optional(TrimmedNonEmptyString),
 });
 export type SourceControlRepositoryLookupInput = typeof SourceControlRepositoryLookupInput.Type;
@@ -73,6 +76,7 @@ export const SourceControlCloneRepositoryInput = Schema.Struct({
   repository: Schema.optional(TrimmedNonEmptyString),
   remoteUrl: Schema.optional(TrimmedNonEmptyString),
   destinationPath: TrimmedNonEmptyString,
+  host: Schema.optional(TrimmedNonEmptyString),
   protocol: Schema.optional(SourceControlCloneProtocol),
 });
 export type SourceControlCloneRepositoryInput = typeof SourceControlCloneRepositoryInput.Type;
@@ -90,6 +94,7 @@ export const SourceControlPublishRepositoryInput = Schema.Struct({
   repository: TrimmedNonEmptyString,
   visibility: SourceControlRepositoryVisibility,
   remoteName: Schema.optional(TrimmedNonEmptyString),
+  host: Schema.optional(TrimmedNonEmptyString),
   protocol: Schema.optional(SourceControlCloneProtocol),
 });
 export type SourceControlPublishRepositoryInput = typeof SourceControlPublishRepositoryInput.Type;
@@ -143,6 +148,8 @@ export type VcsDiscoveryItem = typeof VcsDiscoveryItem.Type;
 
 export const SourceControlProviderDiscoveryItem = Schema.Struct({
   kind: SourceControlProviderKind,
+  id: TrimmedNonEmptyString,
+  host: Schema.Option(TrimmedNonEmptyString),
   ...SourceControlDiscoverySharedFields,
   auth: SourceControlProviderAuth,
 });

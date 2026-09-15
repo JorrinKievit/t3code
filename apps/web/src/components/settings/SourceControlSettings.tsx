@@ -52,6 +52,7 @@ import {
   GitHubIcon,
   GitIcon,
   GitLabIcon,
+  ForgejoIcon,
   JujutsuIcon,
   type Icon,
 } from "../Icons";
@@ -74,7 +75,9 @@ const EMPTY_DISCOVERY_RESULT: SourceControlDiscoveryResult = {
 
 const SOURCE_CONTROL_PROVIDER_ICONS: Partial<Record<SourceControlProviderKind, Icon>> = {
   github: GitHubIcon,
+  "github-enterprise": GitHubIcon,
   gitlab: GitLabIcon,
+  forgejo: ForgejoIcon,
   "azure-devops": AzureDevOpsIcon,
   bitbucket: BitbucketIcon,
 };
@@ -263,6 +266,7 @@ function DiscoveryItemRow({
   readonly children?: ReactNode;
 }) {
   const version = optionLabel(item.version);
+  const host = isProviderDiscoveryItem(item) ? optionLabel(item.host) : null;
   const enabled = isProviderDiscoveryItem(item)
     ? item.status === "available" && item.auth.status === "authenticated"
     : item.status === "available" && item.implemented;
@@ -295,6 +299,9 @@ function DiscoveryItemRow({
                 {item.label}
               </span>
               {version ? <code className="text-xs text-muted-foreground">{version}</code> : null}
+              {host && host !== item.label ? (
+                <code className="text-xs text-muted-foreground">{host}</code>
+              ) : null}
               {isVcsNotReady(item) ? (
                 <Badge variant="warning" size="sm">
                   Coming Soon
@@ -584,7 +591,7 @@ export function SourceControlSettingsPanel() {
               headerAction={hasVersionControlSystems ? null : scanButton}
             >
               {result.sourceControlProviders.map((item) => (
-                <DiscoveryItemRow key={`provider:${item.kind}`} item={item} />
+                <DiscoveryItemRow key={`provider:${item.id}`} item={item} />
               ))}
             </SettingsSection>
           ) : null}
