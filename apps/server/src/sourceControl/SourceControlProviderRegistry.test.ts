@@ -5,7 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import { VcsRepositoryDetectionError } from "@t3tools/contracts";
+import { VcsProcessSpawnError, VcsRepositoryDetectionError } from "@t3tools/contracts";
 
 import * as ServerConfig from "../config.ts";
 import type * as VcsDriver from "../vcs/VcsDriver.ts";
@@ -344,4 +344,91 @@ it.effect(
         );
       }
     }).pipe(Effect.scoped),
+);
+
+it.effect("probes an unclaimable host once for every checkout that shares it", () =>
+  Effect.gen(function* () {
+    let probes = 0;
+    const registry = yield* makeRegistry({
+      remotes: [],
+      // A hosting CLI that is not installed: every refinement spawn fails outright.
+      process: {
+        run: (input) => {
+          if (input.operation === "source-control.discovery.refine-unknown-remote") probes += 1;
+          return Effect.fail(
+            new VcsProcessSpawnError({
+              operation: input.operation,
+              command: input.command,
+              cwd: input.cwd,
+              cause: new Error(`spawn ${input.command} ENOENT`),
+            }),
+          );
+        },
+      },
+    });
+    const refine = (repository: string) =>
+      registry.resolveHandle({
+        // A real directory, so the failed spawns are read as a missing CLI rather than a
+        // missing checkout.
+        cwd: process.cwd(),
+        context: {
+          provider: {
+            kind: "unknown",
+            name: "acme.ghe.com",
+            baseUrl: "https://acme.ghe.com",
+          },
+          remoteName: "origin",
+          remoteUrl: `https://acme.ghe.com/${repository}.git`,
+        },
+      });
+
+    const first = yield* refine("group/one");
+    const second = yield* refine("group/two");
+
+    assert.strictEqual(first.context?.provider.kind, "unknown");
+    assert.strictEqual(first.conclusive, true);
+    assert.strictEqual(second.conclusive, true);
+    assert.strictEqual(probes, 1);
+  }),
+);
+
+it.effect("keeps re-asking when the checkout itself could not be probed", () =>
+  Effect.gen(function* () {
+    let probes = 0;
+    const registry = yield* makeRegistry({
+      remotes: [],
+      process: {
+        run: (input) => {
+          if (input.operation === "source-control.discovery.refine-unknown-remote") probes += 1;
+          return Effect.fail(
+            new VcsProcessSpawnError({
+              operation: input.operation,
+              command: input.command,
+              cwd: input.cwd,
+              cause: new Error(`spawn ${input.command} ENOENT`),
+            }),
+          );
+        },
+      },
+    });
+    const refine = () =>
+      registry.resolveHandle({
+        cwd: "/gone",
+        context: {
+          provider: {
+            kind: "unknown",
+            name: "acme.ghe.com",
+            baseUrl: "https://acme.ghe.com",
+          },
+          remoteName: "origin",
+          remoteUrl: "https://acme.ghe.com/group/one.git",
+        },
+      });
+
+    const first = yield* refine();
+    yield* refine();
+
+    assert.strictEqual(first.conclusive, false);
+    assert.strictEqual(probes, 2);
+  }),
 );
