@@ -297,10 +297,18 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
             context,
           });
         }
-        unknownRemoteRequests.set(key, { cwd: input.cwd, context });
+        const request = { cwd: input.cwd, context };
+        unknownRemoteRequests.set(key, request);
         const provider = yield* Cache.get(unknownRemoteCache, key).pipe(
           Effect.option,
-          Effect.ensuring(Effect.sync(() => unknownRemoteRequests.delete(key))),
+          Effect.ensuring(
+            // Retire only our own request. An unsettled lookup drops its zero-lived cache
+            // entry before this runs, so a later call may already have installed the request
+            // its own lookup is about to read.
+            Effect.sync(() => {
+              if (unknownRemoteRequests.get(key) === request) unknownRemoteRequests.delete(key);
+            }),
+          ),
         );
         if (Option.isNone(provider)) return { context, conclusive: false };
         return {
