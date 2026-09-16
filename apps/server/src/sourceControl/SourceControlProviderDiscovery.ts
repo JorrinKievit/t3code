@@ -6,6 +6,7 @@ import type {
   SourceControlProviderKind,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import type * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 
 import type * as SourceControlProvider from "./SourceControlProvider.ts";
@@ -289,47 +290,80 @@ export function probeSourceControlProvider(input: {
   );
 }
 
+/**
+ * The outcome of asking every discovery spec whether it owns an unknown remote.
+ *
+ * `conclusive` means the specs reached a verdict about the host: one claimed it, or all of
+ * them declined. That answer belongs to the host, so it can be cached and another checkout
+ * of the same host cannot improve on it. It is false when a probe could not run here at
+ * all - that is a property of this checkout, and the next one may still answer.
+ */
+export interface UnknownRemoteRefinement {
+  readonly context: SourceControlProvider.SourceControlProviderContext | null;
+  readonly conclusive: boolean;
+}
+
+type SpecRefinement = {
+  readonly provider: SourceControlProviderInfo | null;
+  /** The spec produced an answer, rather than failing to run its probe. */
+  readonly answered: boolean;
+};
+
 export const refineUnknownRemoteProvider = Effect.fn("refineUnknownRemoteProvider")(
   function* (input: {
     readonly specs: ReadonlyArray<SourceControlProviderDiscoverySpec>;
     readonly process: VcsProcess.VcsProcess["Service"];
+    readonly fileSystem: FileSystem.FileSystem;
     readonly cwd: string;
     readonly context: SourceControlProvider.SourceControlProviderContext | null;
-  }): Effect.fn.Return<SourceControlProvider.SourceControlProviderContext | null> {
-    if (input.context === null || input.context.provider.kind !== "unknown") {
-      return input.context;
+  }): Effect.fn.Return<UnknownRemoteRefinement> {
+    if (input.context === null) return { context: null, conclusive: false };
+    if (input.context.provider.kind !== "unknown") {
+      return { context: input.context, conclusive: true };
     }
     const context = input.context;
 
-    const providers = yield* Effect.forEach(input.specs, (spec) => {
-      if (spec.type === "managed-cli") {
-        return spec.refineUnknownRemote({ cwd: input.cwd, context });
-      }
-      if (!isCliRemoteRefinementSpec(spec)) return Effect.succeed(null);
-      return input.process
-        .run({
-          operation: "source-control.discovery.refine-unknown-remote",
-          command: spec.executable,
-          args: spec.remoteRefinementArgs ?? spec.authArgs,
-          cwd: input.cwd,
-          allowNonZeroExit: true,
-          timeoutMs: probeTimeoutMs(spec),
-          maxOutputBytes: 8_000,
-          appendTruncationMarker: true,
-        })
-        .pipe(
-          Effect.map((auth) =>
-            spec.refineUnknownRemote({
-              cwd: input.cwd,
-              context,
-              auth,
-            }),
-          ),
-          Effect.orElseSucceed(() => null),
-        );
-    });
-    const provider = providers.find((candidate) => candidate !== null);
+    const refinements = yield* Effect.forEach(
+      input.specs,
+      (spec): Effect.Effect<SpecRefinement> => {
+        if (spec.type === "managed-cli") {
+          // The managed spec swallows its own missing CLIs, so a null is a real decline.
+          return spec
+            .refineUnknownRemote({ cwd: input.cwd, context })
+            .pipe(Effect.map((provider) => ({ provider, answered: true })));
+        }
+        if (!isCliRemoteRefinementSpec(spec))
+          return Effect.succeed({ provider: null, answered: true });
+        return input.process
+          .run({
+            operation: "source-control.discovery.refine-unknown-remote",
+            command: spec.executable,
+            args: spec.remoteRefinementArgs ?? spec.authArgs,
+            cwd: input.cwd,
+            allowNonZeroExit: true,
+            timeoutMs: probeTimeoutMs(spec),
+            maxOutputBytes: 8_000,
+            appendTruncationMarker: true,
+          })
+          .pipe(
+            Effect.map((auth) => ({
+              provider: spec.refineUnknownRemote({ cwd: input.cwd, context, auth }),
+              answered: true,
+            })),
+            Effect.orElseSucceed(() => ({ provider: null, answered: false })),
+          );
+      },
+    );
+    const provider = refinements.find((candidate) => candidate.provider !== null)?.provider;
+    if (provider) return { context: { ...context, provider }, conclusive: true };
 
-    return provider ? { ...context, provider } : context;
+    // A spawn failure reports ENOENT for a missing CLI and for a missing checkout alike, so
+    // ask the filesystem which one it was. With the checkout present the CLI is what is
+    // absent, and no other checkout of this host will find it either.
+    const conclusive =
+      refinements.every((candidate) => candidate.answered) ||
+      (yield* input.fileSystem.exists(input.cwd).pipe(Effect.orElseSucceed(() => false)));
+
+    return { context, conclusive };
   },
 );
