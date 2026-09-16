@@ -1,11 +1,10 @@
 import * as Cache from "effect/Cache";
-import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
-import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import {
   SourceControlProviderError,
   type SourceControlProviderDiscoveryItem,
@@ -36,7 +35,12 @@ const PROVIDER_DETECTION_CACHE_TTL = Duration.seconds(5);
 // minutes is what stops a workspace of projects on one unrecognised host from re-probing the
 // CLIs on every read. The window is the delay before newly authenticated CLIs are noticed.
 const UNKNOWN_REMOTE_CACHE_CAPACITY = 512;
-const UNKNOWN_REMOTE_CACHE_TTL_MS = 5 * 60_000;
+const UNKNOWN_REMOTE_CACHE_TTL = Duration.minutes(5);
+
+/** No host verdict this time. Failing keeps the attempt out of the cache. */
+class UnsettledRemote {
+  readonly _tag = "UnsettledRemote";
+}
 
 export interface SourceControlProviderRegistration {
   readonly kind: SourceControlProviderKind;
@@ -217,7 +221,6 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
   function* (registrations: ReadonlyArray<SourceControlProviderRegistration>) {
     const config = yield* ServerConfig;
     const process = yield* VcsProcess.VcsProcess;
-    const fileSystem = yield* FileSystem.FileSystem;
     const vcsRegistry = yield* VcsDriverRegistry.VcsDriverRegistry;
     const providers = new Map<
       SourceControlProviderKind,
@@ -228,54 +231,82 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
     const get: SourceControlProviderRegistry["Service"]["get"] = (kind) =>
       Effect.succeed(providers.get(kind) ?? unsupportedProvider(kind));
 
-    // Keyed by the remote's host rather than its checkout, because that is the scope of the
-    // answer. A requested host narrows a Forgejo login match, so it is part of the key.
-    const unknownRemotes = new Map<
-      string,
-      { readonly provider: SourceControlProviderInfo | null; readonly expiresAt: number }
-    >();
-
     const unknownRemoteKey = (
       context: SourceControlProvider.SourceControlProviderContext,
     ): string | null => {
+      // The host, not the checkout, is what the refinement answers about. A requested host
+      // narrows a Forgejo login match, so it belongs in the key too.
       const host = detectSourceControlProviderFromRemoteUrl(context.remoteUrl)?.baseUrl;
       return host === undefined ? null : `${host}\u0000${context.requestedHost ?? ""}`;
     };
+
+    // Any checkout of a host is an equally good place to ask from, so the lookup takes the
+    // request that most recently asked for this key. `Cache.get` collapses concurrent misses
+    // into one probe, and a refinement that settled nothing fails so it is not cached.
+    const unknownRemoteRequests = new Map<
+      string,
+      {
+        readonly cwd: string;
+        readonly context: SourceControlProvider.SourceControlProviderContext;
+      }
+    >();
+
+    const unknownRemoteCache = yield* Cache.makeWith<
+      string,
+      SourceControlProviderInfo | null,
+      UnsettledRemote
+    >(
+      (key) =>
+        Effect.suspend(() => {
+          const request = unknownRemoteRequests.get(key);
+          if (request === undefined) return Effect.fail(new UnsettledRemote());
+          return refineUnknownRemoteProvider({
+            specs: discoverySpecs,
+            process,
+            cwd: request.cwd,
+            context: request.context,
+          }).pipe(
+            Effect.flatMap((refinement) =>
+              refinement.conclusive
+                ? Effect.succeed(refinement.context?.provider ?? null)
+                : Effect.fail(new UnsettledRemote()),
+            ),
+          );
+        }),
+      {
+        capacity: UNKNOWN_REMOTE_CACHE_CAPACITY,
+        timeToLive: (exit) => (Exit.isSuccess(exit) ? UNKNOWN_REMOTE_CACHE_TTL : Duration.zero),
+      },
+    );
 
     const refineWithHostCache = Effect.fn("SourceControlProviderRegistry.refineUnknownRemote")(
       function* (input: {
         readonly cwd: string;
         readonly context: SourceControlProvider.SourceControlProviderContext | null;
-      }) {
+      }): Effect.fn.Return<UnknownRemoteRefinement> {
         const context = input.context;
         if (context === null || context.provider.kind !== "unknown") {
-          return { context, conclusive: context !== null } satisfies UnknownRemoteRefinement;
+          return { context, conclusive: context !== null };
         }
         const key = unknownRemoteKey(context);
-        const now = yield* Clock.currentTimeMillis;
-        const cached = key === null ? undefined : unknownRemotes.get(key);
-        if (cached !== undefined && cached.expiresAt > now) {
-          return {
-            context: cached.provider === null ? context : { ...context, provider: cached.provider },
-            conclusive: true,
-          } satisfies UnknownRemoteRefinement;
-        }
-        const refinement = yield* refineUnknownRemoteProvider({
-          specs: discoverySpecs,
-          process,
-          fileSystem,
-          cwd: input.cwd,
-          context,
-        });
-        if (key !== null && refinement.conclusive) {
-          // Far more hosts than a workspace has; dropping the lot on overflow just re-probes.
-          if (unknownRemotes.size >= UNKNOWN_REMOTE_CACHE_CAPACITY) unknownRemotes.clear();
-          unknownRemotes.set(key, {
-            provider: refinement.context?.provider ?? null,
-            expiresAt: now + UNKNOWN_REMOTE_CACHE_TTL_MS,
+        if (key === null) {
+          return yield* refineUnknownRemoteProvider({
+            specs: discoverySpecs,
+            process,
+            cwd: input.cwd,
+            context,
           });
         }
-        return refinement;
+        unknownRemoteRequests.set(key, { cwd: input.cwd, context });
+        const provider = yield* Cache.get(unknownRemoteCache, key).pipe(
+          Effect.option,
+          Effect.ensuring(Effect.sync(() => unknownRemoteRequests.delete(key))),
+        );
+        if (Option.isNone(provider)) return { context, conclusive: false };
+        return {
+          context: provider.value === null ? context : { ...context, provider: provider.value },
+          conclusive: true,
+        };
       },
     );
 
