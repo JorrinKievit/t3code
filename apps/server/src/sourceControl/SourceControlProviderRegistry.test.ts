@@ -4,8 +4,13 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import { VcsProcessSpawnError, VcsRepositoryDetectionError } from "@t3tools/contracts";
+import {
+  VcsProcessSpawnError,
+  VcsProcessTimeoutError,
+  VcsRepositoryDetectionError,
+} from "@t3tools/contracts";
 
 import * as ServerConfig from "../config.ts";
 import type * as VcsDriver from "../vcs/VcsDriver.ts";
@@ -346,44 +351,66 @@ it.effect(
     }).pipe(Effect.scoped),
 );
 
+const spawnFailure = (input: VcsProcess.VcsProcessInput, reason: PlatformError.SystemError) =>
+  Effect.fail(
+    new VcsProcessSpawnError({
+      operation: input.operation,
+      command: input.command,
+      cwd: input.cwd,
+      cause: new PlatformError.PlatformError(reason),
+    }),
+  );
+
+/** What `processRunner` reports when the executable is not on PATH. */
+const missingExecutable = (command: string) =>
+  new PlatformError.SystemError({
+    _tag: "NotFound",
+    module: "ChildProcess",
+    method: "spawn",
+    syscall: `spawn ${command}`,
+  });
+
+/** What it reports when the checkout the probe would run in is gone. */
+const missingCheckout = (cwd: string) =>
+  new PlatformError.SystemError({
+    _tag: "NotFound",
+    module: "FileSystem",
+    method: "access",
+    pathOrDescriptor: cwd,
+  });
+
+const unknownEnterpriseRemote = (repository: string) =>
+  ({
+    provider: {
+      kind: "unknown",
+      name: "acme.ghe.test",
+      baseUrl: "https://acme.ghe.test",
+    },
+    remoteName: "origin",
+    remoteUrl: `https://acme.ghe.test/${repository}.git`,
+  }) as const;
+
 it.effect("probes an unclaimable host once for every checkout that shares it", () =>
   Effect.gen(function* () {
     let probes = 0;
     const registry = yield* makeRegistry({
       remotes: [],
-      // A hosting CLI that is not installed: every refinement spawn fails outright.
       process: {
         run: (input) => {
           if (input.operation === "source-control.discovery.refine-unknown-remote") probes += 1;
-          return Effect.fail(
-            new VcsProcessSpawnError({
-              operation: input.operation,
-              command: input.command,
-              cwd: input.cwd,
-              cause: new Error(`spawn ${input.command} ENOENT`),
-            }),
-          );
+          return spawnFailure(input, missingExecutable(input.command));
         },
       },
     });
-    const refine = (repository: string) =>
-      registry.resolveHandle({
-        // A real directory, so the failed spawns are read as a missing CLI rather than a
-        // missing checkout.
-        cwd: process.cwd(),
-        context: {
-          provider: {
-            kind: "unknown",
-            name: "acme.ghe.com",
-            baseUrl: "https://acme.ghe.com",
-          },
-          remoteName: "origin",
-          remoteUrl: `https://acme.ghe.com/${repository}.git`,
-        },
-      });
 
-    const first = yield* refine("group/one");
-    const second = yield* refine("group/two");
+    const first = yield* registry.resolveHandle({
+      cwd: "/one",
+      context: unknownEnterpriseRemote("group/one"),
+    });
+    const second = yield* registry.resolveHandle({
+      cwd: "/two",
+      context: unknownEnterpriseRemote("group/two"),
+    });
 
     assert.strictEqual(first.context?.provider.kind, "unknown");
     assert.strictEqual(first.conclusive, true);
@@ -400,35 +427,80 @@ it.effect("keeps re-asking when the checkout itself could not be probed", () =>
       process: {
         run: (input) => {
           if (input.operation === "source-control.discovery.refine-unknown-remote") probes += 1;
-          return Effect.fail(
-            new VcsProcessSpawnError({
-              operation: input.operation,
-              command: input.command,
-              cwd: input.cwd,
-              cause: new Error(`spawn ${input.command} ENOENT`),
-            }),
-          );
+          return spawnFailure(input, missingCheckout(input.cwd));
         },
       },
     });
     const refine = () =>
-      registry.resolveHandle({
-        cwd: "/gone",
-        context: {
-          provider: {
-            kind: "unknown",
-            name: "acme.ghe.com",
-            baseUrl: "https://acme.ghe.com",
-          },
-          remoteName: "origin",
-          remoteUrl: "https://acme.ghe.com/group/one.git",
-        },
-      });
+      registry.resolveHandle({ cwd: "/gone", context: unknownEnterpriseRemote("group/one") });
 
     const first = yield* refine();
     yield* refine();
 
     assert.strictEqual(first.conclusive, false);
     assert.strictEqual(probes, 2);
+  }),
+);
+
+it.effect("keeps re-asking when a hosting CLI probe times out", () =>
+  Effect.gen(function* () {
+    let probes = 0;
+    const registry = yield* makeRegistry({
+      remotes: [],
+      process: {
+        run: (input) => {
+          if (input.operation !== "source-control.discovery.refine-unknown-remote") {
+            return Effect.succeed(processOutput(""));
+          }
+          probes += 1;
+          return Effect.fail(
+            new VcsProcessTimeoutError({
+              operation: input.operation,
+              command: input.command,
+              cwd: input.cwd,
+              timeoutMs: 5_000,
+            }),
+          );
+        },
+      },
+    });
+    const refine = () =>
+      registry.resolveHandle({ cwd: "/one", context: unknownEnterpriseRemote("group/one") });
+
+    const first = yield* refine();
+    yield* refine();
+
+    assert.strictEqual(first.conclusive, false);
+    assert.strictEqual(probes, 2);
+  }),
+);
+
+it.effect("collapses concurrent misses for one host into a single probe", () =>
+  Effect.gen(function* () {
+    let probes = 0;
+    const registry = yield* makeRegistry({
+      remotes: [],
+      process: {
+        run: (input) => {
+          if (input.operation !== "source-control.discovery.refine-unknown-remote") {
+            return Effect.succeed(processOutput(""));
+          }
+          probes += 1;
+          return spawnFailure(input, missingExecutable(input.command));
+        },
+      },
+    });
+
+    const handles = yield* Effect.forEach(
+      ["/one", "/two", "/three", "/four"],
+      (cwd) => registry.resolveHandle({ cwd, context: unknownEnterpriseRemote("group/one") }),
+      { concurrency: "unbounded" },
+    );
+
+    assert.deepStrictEqual(
+      handles.map((handle) => handle.conclusive),
+      [true, true, true, true],
+    );
+    assert.strictEqual(probes, 1);
   }),
 );
