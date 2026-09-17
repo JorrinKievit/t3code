@@ -11,6 +11,7 @@
  * prefix itself rather than from anything the hub prints.
  */
 import {
+  DEFAULT_DEVICE_STREAM_SOURCE,
   type DeviceHostSummary,
   type DevicePlatform,
   type DevicePlatformAvailability,
@@ -41,11 +42,12 @@ import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import * as ServerConfig from "../config.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as DeviceHost from "./DeviceHost.ts";
 import {
   agentDeviceStateDir,
-  DEVICE_HUB_ARGS,
+  deviceHubArgs,
   type DeviceToolPaths,
   ensureAgentDevice,
   ensureDeviceHub,
@@ -197,6 +199,7 @@ const deviceHostEnvironment = (
 export const make = Effect.fn("LocalDeviceHost.make")(function* () {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const config = yield* ServerConfig.ServerConfig;
+  const settings = yield* ServerSettings.ServerSettingsService;
   const path = yield* Path.Path;
   const fs = yield* FileSystem.FileSystem;
   const net = yield* NetService.NetService;
@@ -319,6 +322,10 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
     nodePath: string,
   ): Effect.fn.Return<HubProcess, DeviceHost.DeviceHostError> {
     yield* reapStaleHub;
+    const streamSource = yield* settings.getSettings.pipe(
+      Effect.map((value) => value.deviceStreamSource),
+      Effect.orElseSucceed(() => DEFAULT_DEVICE_STREAM_SOURCE),
+    );
     yield* fs
       .makeDirectory(agentDeviceStateDir(path, config.stateDir), { recursive: true })
       .pipe(Effect.ignore);
@@ -338,7 +345,14 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
       .spawn(
         ChildProcess.make(
           nodePath,
-          [hubTool.entryPath, "--port", String(port), "--host", "127.0.0.1", ...DEVICE_HUB_ARGS],
+          [
+            hubTool.entryPath,
+            "--port",
+            String(port),
+            "--host",
+            "127.0.0.1",
+            ...deviceHubArgs(streamSource),
+          ],
           {
             detached: false,
             shell: false,
