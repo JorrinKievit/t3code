@@ -201,6 +201,18 @@ describe("Android video handshake", () => {
     return buffer;
   };
 
+  const semuDelta = () => {
+    const annexB = [0, 0, 0, 1, 0x41, 0x9a, 0x02];
+    const buffer = new ArrayBuffer(16 + annexB.length);
+    const view = new DataView(buffer);
+    view.setUint32(0, 0x53454d55);
+    view.setUint8(4, 1);
+    view.setUint8(5, 0);
+    view.setBigUint64(8, 2000n);
+    new Uint8Array(buffer).set(annexB, 16);
+    return buffer;
+  };
+
   const setup = () => {
     const sockets: FakeSocket[] = [];
     class FakeSocket {
@@ -286,6 +298,31 @@ describe("Android video handshake", () => {
     expect(decoders[0]?.decode).toHaveBeenCalledTimes(1);
     expect(socket.send).not.toHaveBeenCalled();
     expect(onStatus).toHaveBeenCalledWith("streaming", undefined);
+    client.stop();
+  });
+
+  it("does not reset video for deltas that arrive while the decoder is configuring", async () => {
+    const { client, sockets } = setup();
+    client.start();
+    const socket = sockets[0]!;
+    socket.onmessage?.({ data: semuKeyframe() });
+    socket.onmessage?.({ data: semuDelta() });
+    await flush();
+
+    expect(socket.send).not.toHaveBeenCalled();
+    client.stop();
+  });
+
+  it("drops a decoder configured from a socket that closed while support was checked", async () => {
+    const { client, sockets, decoders, onStatus } = setup();
+    client.start();
+    const socket = sockets[0]!;
+    socket.onmessage?.({ data: semuKeyframe() });
+    socket.onclose?.({ code: 1006, reason: "" });
+    await flush();
+
+    expect(decoders[0]?.decode).not.toHaveBeenCalled();
+    expect(onStatus).not.toHaveBeenCalledWith("streaming", undefined);
     client.stop();
   });
 

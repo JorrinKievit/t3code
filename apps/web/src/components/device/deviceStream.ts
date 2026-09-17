@@ -587,6 +587,9 @@ export function createDeviceStreamClient(
         void configureDecoder({ codec: avcCodecString(scanned.sps) }).then((configured) => {
           configuring = false;
           awaitingKeyframe = true;
+          // The socket can be replaced while support is being checked; a
+          // decoder built from the closed stream's SPS must not paint here.
+          if (socket !== ws) return closeDecoder();
           if (!configured) return;
           // The SPS came in on this access unit, so decode it here. Asking for
           // another keyframe instead makes scrcpy restart its encoder, which
@@ -597,7 +600,9 @@ export function createDeviceStreamClient(
         return;
       }
       if (!videoDecoder || videoDecoder.state !== "configured") {
-        if (!isKey) requestKeyframe();
+        // Deltas arriving mid-configure are expected; resetting on them would
+        // restart the encoder underneath the handshake that is already running.
+        if (!isKey && !configuring) requestKeyframe();
         return;
       }
       decode(isKey, packet.data, packet.timestamp);
