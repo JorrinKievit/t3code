@@ -47,6 +47,7 @@ function makeRegistry(input: {
   readonly process?: Partial<VcsProcess.VcsProcess["Service"]>;
   readonly github?: Partial<GitHubCli.GitHubCli["Service"]>;
   readonly gitlab?: Partial<GitLabCli.GitLabCli["Service"]>;
+  readonly forgejo?: Partial<ForgejoCli.ForgejoCli["Service"]>;
   readonly resolve?: VcsDriverRegistry.VcsDriverRegistry["Service"]["resolve"];
 }) {
   const driver = {
@@ -101,7 +102,10 @@ function makeRegistry(input: {
         Layer.mock(BitbucketApi.BitbucketApi)({}),
         Layer.mock(GitHubCli.GitHubCli)(input.github ?? {}),
         Layer.mock(GitLabCli.GitLabCli)(input.gitlab ?? {}),
-        Layer.mock(ForgejoCli.ForgejoCli)({ listLogins: () => Effect.succeed([]) }),
+        Layer.mock(ForgejoCli.ForgejoCli)({
+          listLogins: () => Effect.succeed([]),
+          ...input.forgejo,
+        }),
         ServerConfig.layerTest(process.cwd(), {
           prefix: "t3-source-control-registry-test-",
         }).pipe(Layer.provide(NodeServices.layer)),
@@ -501,5 +505,49 @@ it.effect("collapses concurrent misses for one host into a single probe", () =>
       ["unknown", "unknown", "unknown", "unknown"],
     );
     assert.strictEqual(probes, 1);
+  }),
+);
+
+const forgejoLogin = (name: string, url: string) => ({
+  name,
+  url,
+  user: "ci",
+  default: "false",
+});
+
+const mountedRemote = (mount: string, repository: string) =>
+  ({
+    provider: { kind: "unknown", name: "acme.test", baseUrl: "https://acme.test" },
+    remoteName: "origin",
+    remoteUrl: `https://acme.test/${mount}/${repository}.git`,
+  }) as const;
+
+it.effect("keeps two instances mounted on one host apart", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({
+      remotes: [],
+      process: {
+        run: (input) => spawnFailure(input, missingExecutable(input.command)),
+      },
+      forgejo: {
+        listLogins: () =>
+          Effect.succeed([
+            forgejoLogin("one", "https://acme.test/forge-one"),
+            forgejoLogin("two", "https://acme.test/forge-two"),
+          ]),
+      },
+    });
+
+    const one = yield* registry.resolveHandle({
+      cwd: "/one",
+      context: mountedRemote("forge-one", "group/one"),
+    });
+    const two = yield* registry.resolveHandle({
+      cwd: "/two",
+      context: mountedRemote("forge-two", "group/two"),
+    });
+
+    assert.strictEqual(one.context?.provider.baseUrl, "https://acme.test/forge-one");
+    assert.strictEqual(two.context?.provider.baseUrl, "https://acme.test/forge-two");
   }),
 );

@@ -41,6 +41,25 @@ class UnsettledRemote {
   readonly _tag = "UnsettledRemote";
 }
 
+/**
+ * The part of an HTTP remote that precedes its `<owner>/<repository>`, which is where a
+ * self-hosted instance is mounted. A login only claims the remotes under its own mount, so
+ * two instances sharing a host must not share a refinement verdict. SSH remotes are matched
+ * by host alone and have no mount.
+ */
+function remoteMountPath(remoteUrl: string): string {
+  if (!/^https?:\/\//iu.test(remoteUrl)) return "";
+  try {
+    return new URL(remoteUrl).pathname
+      .replace(/^\/+|\/+$/gu, "")
+      .split("/")
+      .slice(0, -2)
+      .join("/");
+  } catch {
+    return "";
+  }
+}
+
 export interface SourceControlProviderRegistration {
   readonly kind: SourceControlProviderKind;
   readonly provider: SourceControlProvider.SourceControlProvider["Service"];
@@ -231,7 +250,7 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
       // narrows a Forgejo login match, so it belongs in the key too.
       const host = detectSourceControlProviderFromRemoteUrl(context.remoteUrl)?.baseUrl;
       if (host === undefined) return null;
-      return `${host}\u0000${context.requestedHost ?? ""}`;
+      return `${host}\u0000${remoteMountPath(context.remoteUrl)}\u0000${context.requestedHost ?? ""}`;
     };
 
     // Any checkout of a host is an equally good place to ask from, so the lookup takes the
@@ -375,15 +394,21 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
       get,
       resolveHandle,
       resolve: (input) => resolveHandle(input).pipe(Effect.map((handle) => handle.provider)),
-      discover: Effect.forEach(
-        discoverySpecs,
-        (spec) =>
-          probeSourceControlProvider({
-            spec,
-            process,
-            cwd: config.cwd,
-          }),
-        { concurrency: "unbounded" },
+      // An explicit re-discovery is how a freshly installed or authenticated CLI announces
+      // itself, so the cached host verdicts must not outlive it.
+      discover: Cache.invalidateAll(unknownRemoteCache).pipe(
+        Effect.andThen(
+          Effect.forEach(
+            discoverySpecs,
+            (spec) =>
+              probeSourceControlProvider({
+                spec,
+                process,
+                cwd: config.cwd,
+              }),
+            { concurrency: "unbounded" },
+          ),
+        ),
       ),
     });
   },
