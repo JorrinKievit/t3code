@@ -9,7 +9,7 @@ import {
   SourceControlProviderError,
   type SourceControlProviderDiscoveryItem,
 } from "@t3tools/contracts";
-import type { SourceControlProviderInfo, SourceControlProviderKind } from "@t3tools/contracts";
+import type { SourceControlProviderKind } from "@t3tools/contracts";
 import { detectSourceControlProviderFromRemoteUrl } from "@t3tools/shared/sourceControl";
 
 import * as AzureDevOpsSourceControlProvider from "./AzureDevOpsSourceControlProvider.ts";
@@ -20,8 +20,11 @@ import * as ForgejoSourceControlProvider from "./ForgejoSourceControlProvider.ts
 import * as SourceControlProvider from "./SourceControlProvider.ts";
 import {
   probeSourceControlProvider,
+  probeUnknownRemoteProvider,
   refineUnknownRemoteProvider,
+  selectUnknownRemoteProvider,
   type SourceControlProviderDiscoverySpec,
+  type UnknownRemoteProbe,
 } from "./SourceControlProviderDiscovery.ts";
 import { ServerConfig } from "../config.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
@@ -36,28 +39,9 @@ const PROVIDER_DETECTION_CACHE_TTL = Duration.seconds(5);
 const UNKNOWN_REMOTE_CACHE_CAPACITY = 512;
 const UNKNOWN_REMOTE_CACHE_TTL = Duration.minutes(5);
 
-/** No host verdict this time. Failing keeps the attempt out of the cache. */
-class UnsettledRemote {
-  readonly _tag = "UnsettledRemote";
-}
-
-/**
- * The part of an HTTP remote that precedes its `<owner>/<repository>`, which is where a
- * self-hosted instance is mounted. A login only claims the remotes under its own mount, so
- * two instances sharing a host must not share a refinement verdict. SSH remotes are matched
- * by host alone and have no mount.
- */
-function remoteMountPath(remoteUrl: string): string {
-  if (!/^https?:\/\//iu.test(remoteUrl)) return "";
-  try {
-    return new URL(remoteUrl).pathname
-      .replace(/^\/+|\/+$/gu, "")
-      .split("/")
-      .slice(0, -2)
-      .join("/");
-  } catch {
-    return "";
-  }
+/** Nothing to probe with: the request that would have supplied a checkout is already gone. */
+class UnprobedRemote {
+  readonly _tag = "UnprobedRemote";
 }
 
 export interface SourceControlProviderRegistration {
@@ -243,52 +227,45 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
     const get: SourceControlProviderRegistry["Service"]["get"] = (kind) =>
       Effect.succeed(providers.get(kind) ?? unsupportedProvider(kind));
 
-    const unknownRemoteKey = (
-      context: SourceControlProvider.SourceControlProviderContext,
-    ): string | null => {
-      // The host, not the checkout, is what the refinement answers about. A requested host
-      // narrows a Forgejo login match, so it belongs in the key too.
-      const host = detectSourceControlProviderFromRemoteUrl(context.remoteUrl)?.baseUrl;
+    const unknownRemoteKey = (remoteUrl: string): string | null => {
+      // Only the probe is keyed, and the probe reads a host. Which remote on that host asked
+      // changes nothing - except for `fj`, which reports its logins over http when the asking
+      // remote is http, so the scheme rides along.
+      const host = detectSourceControlProviderFromRemoteUrl(remoteUrl)?.baseUrl;
       if (host === undefined) return null;
-      return `${host}\u0000${remoteMountPath(context.remoteUrl)}\u0000${context.requestedHost ?? ""}`;
+      return `${host}\u0000${/^http:\/\//iu.test(remoteUrl) ? "http" : "https"}`;
     };
 
-    // Any checkout of a host is an equally good place to ask from, so the lookup takes the
+    // Any checkout of a host is an equally good place to probe from, so the lookup takes the
     // request that most recently asked for this key. `Cache.get` collapses concurrent misses
-    // into one probe, and a refinement that settled nothing fails so it is not cached.
-    const unknownRemoteRequests = new Map<
-      string,
-      {
-        readonly cwd: string;
-        readonly context: SourceControlProvider.SourceControlProviderContext;
-      }
-    >();
+    // into one probe.
+    const unknownRemoteRequests = new Map<string, { readonly cwd: string; readonly url: string }>();
 
     const unknownRemoteCache = yield* Cache.makeWith<
       string,
-      SourceControlProviderInfo | null,
-      UnsettledRemote
+      ReadonlyArray<UnknownRemoteProbe>,
+      UnprobedRemote
     >(
       (key) =>
         Effect.suspend(() => {
           const request = unknownRemoteRequests.get(key);
-          if (request === undefined) return Effect.fail(new UnsettledRemote());
-          return refineUnknownRemoteProvider({
+          if (request === undefined) return Effect.fail(new UnprobedRemote());
+          return probeUnknownRemoteProvider({
             specs: discoverySpecs,
             process,
             cwd: request.cwd,
-            context: request.context,
-          }).pipe(
-            Effect.flatMap((refinement) =>
-              refinement.conclusive
-                ? Effect.succeed(refinement.context?.provider ?? null)
-                : Effect.fail(new UnsettledRemote()),
-            ),
-          );
+            remoteUrl: request.url,
+          });
         }),
       {
         capacity: UNKNOWN_REMOTE_CACHE_CAPACITY,
-        timeToLive: (exit) => (Exit.isSuccess(exit) ? UNKNOWN_REMOTE_CACHE_TTL : Duration.zero),
+        // A spec that could not run has nothing to say about the host, and keeping its silence
+        // would settle the host on nothing. Expiring at once drops the entry while still
+        // letting everyone waiting on this probe share its answer.
+        timeToLive: (exit) =>
+          Exit.isSuccess(exit) && exit.value.every((probe) => probe.answered)
+            ? UNKNOWN_REMOTE_CACHE_TTL
+            : Duration.zero,
       },
     );
 
@@ -299,31 +276,32 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
       }) {
         const context = input.context;
         if (context === null || context.provider.kind !== "unknown") return context;
-        const key = unknownRemoteKey(context);
+        const key = unknownRemoteKey(context.remoteUrl);
         if (key === null) {
-          const refinement = yield* refineUnknownRemoteProvider({
+          return yield* refineUnknownRemoteProvider({
             specs: discoverySpecs,
             process,
             cwd: input.cwd,
             context,
           });
-          return refinement.context;
         }
-        const request = { cwd: input.cwd, context };
+        const request = { cwd: input.cwd, url: context.remoteUrl };
         unknownRemoteRequests.set(key, request);
-        const provider = yield* Cache.get(unknownRemoteCache, key).pipe(
+        const probes = yield* Cache.get(unknownRemoteCache, key).pipe(
           Effect.option,
           Effect.ensuring(
-            // Retire only our own request. An unsettled lookup drops its zero-lived cache
-            // entry before this runs, so a later call may already have installed the request
-            // its own lookup is about to read.
+            // Retire only our own request. An entry that expired at once is dropped before
+            // this runs, so a later call may already have installed the request its own
+            // lookup is about to read.
             Effect.sync(() => {
               if (unknownRemoteRequests.get(key) === request) unknownRemoteRequests.delete(key);
             }),
           ),
         );
-        if (Option.isNone(provider) || provider.value === null) return context;
-        return { ...context, provider: provider.value };
+        // The probe reads the host; the match reads this remote. Sharing the first and
+        // repeating the second is what keeps a mounted instance from inheriting its
+        // neighbour's verdict.
+        return Option.isNone(probes) ? context : selectUnknownRemoteProvider(probes.value, context);
       },
     );
 

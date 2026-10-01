@@ -564,19 +564,22 @@ it.effect("keeps re-asking when the Forgejo CLI could not list its logins", () =
   }),
 );
 
-it.effect("keeps two instances mounted on one host apart", () =>
+it.effect("keeps two instances mounted on one host apart, on one probe", () =>
   Effect.gen(function* () {
+    let lists = 0;
     const registry = yield* makeRegistry({
       remotes: [],
       process: {
         run: (input) => spawnFailure(input, missingExecutable(input.command)),
       },
       forgejo: {
-        listLogins: () =>
-          Effect.succeed([
+        listLogins: () => {
+          lists += 1;
+          return Effect.succeed([
             forgejoLogin("one", "https://acme.test/forge-one"),
             forgejoLogin("two", "https://acme.test/forge-two"),
-          ]),
+          ]);
+        },
       },
     });
 
@@ -591,5 +594,64 @@ it.effect("keeps two instances mounted on one host apart", () =>
 
     assert.strictEqual(one.context?.provider.baseUrl, "https://acme.test/forge-one");
     assert.strictEqual(two.context?.provider.baseUrl, "https://acme.test/forge-two");
+    // Once for fj and once for tea, for the host, and not again for the second instance.
+    assert.strictEqual(lists, 2);
+  }),
+);
+
+it.effect("shares one probe across the namespaces of a host", () =>
+  Effect.gen(function* () {
+    let probes = 0;
+    const registry = yield* makeRegistry({
+      remotes: [],
+      process: {
+        run: (input) => {
+          if (input.operation === "source-control.discovery.refine-unknown-remote") probes += 1;
+          return spawnFailure(input, missingExecutable(input.command));
+        },
+      },
+    });
+
+    // A self-hosted GitLab nests repositories under subgroups. None of that is a mount.
+    for (const namespace of ["group-a/subgroup", "group-b/subgroup", "group-c"]) {
+      const handle = yield* registry.resolveHandle({
+        cwd: "/one",
+        context: mountedRemote(namespace, "repo"),
+      });
+      assert.strictEqual(handle.context?.provider.kind, "unknown");
+    }
+
+    assert.strictEqual(probes, 1);
+  }),
+);
+
+it.effect("asks tea when the fj login store could not be read", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({
+      remotes: [],
+      process: {
+        run: (input) => spawnFailure(input, missingExecutable(input.command)),
+      },
+      forgejo: {
+        listLogins: ({ command, cwd }) =>
+          command === "fj"
+            ? Effect.fail(
+                new ForgejoCli.ForgejoCliError({
+                  command: "fj",
+                  cwd,
+                  detail: "Could not read fj authentication storage.",
+                }),
+              )
+            : Effect.succeed([forgejoLogin("acme", "https://acme.test/forge")]),
+      },
+    });
+
+    const handle = yield* registry.resolveHandle({
+      cwd: "/one",
+      context: mountedRemote("forge", "group/one"),
+    });
+
+    assert.strictEqual(handle.context?.provider.kind, "forgejo");
+    assert.strictEqual(handle.context?.provider.baseUrl, "https://acme.test/forge");
   }),
 );
