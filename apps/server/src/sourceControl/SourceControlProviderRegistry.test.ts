@@ -413,8 +413,7 @@ it.effect("probes an unclaimable host once for every checkout that shares it", (
     });
 
     assert.strictEqual(first.context?.provider.kind, "unknown");
-    assert.strictEqual(first.conclusive, true);
-    assert.strictEqual(second.conclusive, true);
+    assert.strictEqual(second.context?.provider.kind, "unknown");
     assert.strictEqual(probes, 1);
   }),
 );
@@ -437,7 +436,7 @@ it.effect("keeps re-asking when the checkout itself could not be probed", () =>
     const first = yield* refine();
     yield* refine();
 
-    assert.strictEqual(first.conclusive, false);
+    assert.strictEqual(first.context?.provider.kind, "unknown");
     assert.strictEqual(probes, 2);
   }),
 );
@@ -470,7 +469,7 @@ it.effect("keeps re-asking when a hosting CLI probe times out", () =>
     const first = yield* refine();
     yield* refine();
 
-    assert.strictEqual(first.conclusive, false);
+    assert.strictEqual(first.context?.provider.kind, "unknown");
     assert.strictEqual(probes, 2);
   }),
 );
@@ -498,8 +497,8 @@ it.effect("collapses concurrent misses for one host into a single probe", () =>
     );
 
     assert.deepStrictEqual(
-      handles.map((handle) => handle.conclusive),
-      [true, true, true, true],
+      handles.map((handle) => handle.context?.provider.kind),
+      ["unknown", "unknown", "unknown", "unknown"],
     );
     assert.strictEqual(probes, 1);
   }),

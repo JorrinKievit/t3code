@@ -22,7 +22,6 @@ import {
   probeSourceControlProvider,
   refineUnknownRemoteProvider,
   type SourceControlProviderDiscoverySpec,
-  type UnknownRemoteRefinement,
 } from "./SourceControlProviderDiscovery.ts";
 import { ServerConfig } from "../config.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
@@ -51,12 +50,6 @@ export interface SourceControlProviderRegistration {
 export interface SourceControlProviderHandle {
   readonly provider: SourceControlProvider.SourceControlProvider["Service"];
   readonly context: SourceControlProvider.SourceControlProviderContext | null;
-  /**
-   * The remote's provider was settled for the host: another checkout of the same host cannot
-   * refine it further. Optional so narrow test doubles stay lightweight; absent reads as "not
-   * settled", which keeps callers walking to the next checkout.
-   */
-  readonly conclusive?: boolean;
 }
 
 export class SourceControlProviderRegistry extends Context.Service<
@@ -237,7 +230,8 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
       // The host, not the checkout, is what the refinement answers about. A requested host
       // narrows a Forgejo login match, so it belongs in the key too.
       const host = detectSourceControlProviderFromRemoteUrl(context.remoteUrl)?.baseUrl;
-      return host === undefined ? null : `${host}\u0000${context.requestedHost ?? ""}`;
+      if (host === undefined) return null;
+      return `${host}\u0000${context.requestedHost ?? ""}`;
     };
 
     // Any checkout of a host is an equally good place to ask from, so the lookup takes the
@@ -283,19 +277,18 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
       function* (input: {
         readonly cwd: string;
         readonly context: SourceControlProvider.SourceControlProviderContext | null;
-      }): Effect.fn.Return<UnknownRemoteRefinement> {
+      }) {
         const context = input.context;
-        if (context === null || context.provider.kind !== "unknown") {
-          return { context, conclusive: context !== null };
-        }
+        if (context === null || context.provider.kind !== "unknown") return context;
         const key = unknownRemoteKey(context);
         if (key === null) {
-          return yield* refineUnknownRemoteProvider({
+          const refinement = yield* refineUnknownRemoteProvider({
             specs: discoverySpecs,
             process,
             cwd: input.cwd,
             context,
           });
+          return refinement.context;
         }
         const request = { cwd: input.cwd, context };
         unknownRemoteRequests.set(key, request);
@@ -310,11 +303,8 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
             }),
           ),
         );
-        if (Option.isNone(provider)) return { context, conclusive: false };
-        return {
-          context: provider.value === null ? context : { ...context, provider: provider.value },
-          conclusive: true,
-        };
+        if (Option.isNone(provider) || provider.value === null) return context;
+        return { ...context, provider: provider.value };
       },
     );
 
@@ -346,8 +336,7 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
         );
         const context = selectProviderContext(remotes.remotes);
 
-        const refinement = yield* refineWithHostCache({ cwd, context });
-        return refinement.context;
+        return yield* refineWithHostCache({ cwd, context });
       },
     );
 
@@ -362,19 +351,15 @@ export const makeWithProviders = Effect.fn("makeSourceControlProviderRegistryWit
 
     const resolveHandle: SourceControlProviderRegistry["Service"]["resolveHandle"] = (input) =>
       (input.context === undefined
-        ? // The per-cwd cache keeps only the context, so this path reports no host verdict.
-          Cache.get(providerContextCache, input.cwd).pipe(
-            Effect.map((context): UnknownRemoteRefinement => ({ context, conclusive: false })),
-          )
+        ? Cache.get(providerContextCache, input.cwd)
         : refineWithHostCache({ cwd: input.cwd, context: input.context })
       ).pipe(
-        Effect.map(({ context, conclusive }) => {
+        Effect.map((context) => {
           const kind = context?.provider.kind ?? "unknown";
           const provider = providers.get(kind) ?? unsupportedProvider(kind);
           return {
             provider: bindProviderContext(provider, context),
             context,
-            conclusive,
           } satisfies SourceControlProviderHandle;
         }),
       );
