@@ -3,6 +3,7 @@ import type {
   SourceControlProviderAuth,
   SourceControlProviderDiscoveryItem,
   SourceControlProviderInfo,
+  SourceControlProviderError,
   SourceControlProviderKind,
   VcsError,
 } from "@t3tools/contracts";
@@ -55,7 +56,7 @@ export type SourceControlManagedCliDiscoverySpec = SourceControlDiscoverySpecBas
   readonly refineUnknownRemote: (input: {
     readonly cwd: string;
     readonly context: SourceControlProvider.SourceControlProviderContext;
-  }) => Effect.Effect<SourceControlProviderInfo | null>;
+  }) => Effect.Effect<SourceControlProviderInfo | null, SourceControlProviderError>;
 };
 
 export type SourceControlProviderDiscoverySpec =
@@ -344,10 +345,12 @@ export const refineUnknownRemoteProvider = Effect.fn("refineUnknownRemoteProvide
       input.specs,
       (spec): Effect.Effect<SpecRefinement> => {
         if (spec.type === "managed-cli") {
-          // The managed spec swallows its own missing CLIs, so a null is an answer already.
-          return spec
-            .refineUnknownRemote({ cwd: input.cwd, context })
-            .pipe(Effect.map((provider) => ({ provider, answered: true })));
+          // A managed spec swallows its own missing CLIs, so a null is an answer already. It
+          // raises everything else, and those failures say nothing about the host.
+          return spec.refineUnknownRemote({ cwd: input.cwd, context }).pipe(
+            Effect.map((provider) => ({ provider, answered: true })),
+            Effect.catch(() => Effect.succeed({ provider: null, answered: false })),
+          );
         }
         if (!isCliRemoteRefinementSpec(spec))
           return Effect.succeed({ provider: null, answered: true });

@@ -522,6 +522,48 @@ const mountedRemote = (mount: string, repository: string) =>
     remoteUrl: `https://acme.test/${mount}/${repository}.git`,
   }) as const;
 
+it.effect("keeps re-asking when the Forgejo CLI could not list its logins", () =>
+  Effect.gen(function* () {
+    let calls = 0;
+    const registry = yield* makeRegistry({
+      remotes: [],
+      process: {
+        run: (input) => spawnFailure(input, missingExecutable(input.command)),
+      },
+      forgejo: {
+        // No fj login anywhere, and `tea login list` fails once. The host is a Forgejo server
+        // whose name gives nothing away, so this attempt learned nothing about it.
+        listLogins: ({ command, cwd }) => {
+          if (command === "fj") return Effect.succeed([]);
+          calls += 1;
+          return calls === 1
+            ? Effect.fail(
+                new ForgejoCli.ForgejoCliError({
+                  command: "tea",
+                  cwd,
+                  detail: "tea login list timed out.",
+                }),
+              )
+            : Effect.succeed([forgejoLogin("acme", "https://acme.test/forge")]);
+        },
+      },
+    });
+
+    const first = yield* registry.resolveHandle({
+      cwd: "/gone",
+      context: mountedRemote("forge", "group/one"),
+    });
+    const second = yield* registry.resolveHandle({
+      cwd: "/healthy",
+      context: mountedRemote("forge", "group/one"),
+    });
+
+    assert.strictEqual(first.context?.provider.kind, "unknown");
+    assert.strictEqual(second.context?.provider.kind, "forgejo");
+    assert.strictEqual(second.context?.provider.baseUrl, "https://acme.test/forge");
+  }),
+);
+
 it.effect("keeps two instances mounted on one host apart", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry({

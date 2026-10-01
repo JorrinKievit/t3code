@@ -148,7 +148,23 @@ export const makeDiscovery = Effect.gen(function* () {
             cwd: input.cwd,
             command,
             remoteUrl: input.context.remoteUrl,
-          }).pipe(Effect.orElseSucceed(() => []));
+          }).pipe(
+            // A CLI that is not installed has no logins and says so for every checkout. Any
+            // other failure - a timeout, a broken login store - is about this attempt, and
+            // passing it off as "no match" would settle the host on nothing.
+            Effect.catch((error) =>
+              error.reason === "missing-cli"
+                ? Effect.succeed([])
+                : new SourceControlProviderError({
+                    provider: "forgejo",
+                    operation: "refineUnknownRemote",
+                    cwd: input.cwd,
+                    command: error.command,
+                    detail: error.detail,
+                    cause: error,
+                  }),
+            ),
+          );
           const login = ForgejoCli.matchForgejoLogin(logins, remote, input.context.requestedHost);
           if (login) return { kind: "forgejo" as const, name: discovery.label, baseUrl: login.url };
         }
