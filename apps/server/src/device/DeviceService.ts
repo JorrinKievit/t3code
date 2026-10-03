@@ -606,14 +606,16 @@ export const makeWithHosts = Effect.fn("DeviceService.makeWithHosts")(function* 
         nextAgentAccess &&
         (input.agentAccessEnabled === true || restartedForSource)
       ) {
-        yield* agentReadinessIfSupported();
-        // One unreachable remote host must not fail the switch; the failure is
-        // already on that host's status.
+        // Remote agents come back first: a local readiness failure leaves this
+        // effect, and nothing else restarts a remote daemon. One unreachable
+        // remote must not fail the switch either, and its failure is already on
+        // that host's status.
         yield* Effect.forEach(
           agentHostIds,
           (hostId) => Effect.ignore(agentReadinessIfSupported(hostId)),
           { discard: true },
         );
+        yield* agentReadinessIfSupported();
       }
       return yield* list;
     },
