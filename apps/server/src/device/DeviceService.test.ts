@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
   DeviceId,
+  DeviceHostId,
   DeviceOperationError,
   LOCAL_DEVICE_HOST_ID,
   ThreadId,
@@ -69,6 +70,7 @@ const fixture = Effect.fn("fixture")(function* (
   runtimeFailure?: NodeRuntimeUnavailableError | DeviceHost.DeviceHostError,
   inspectError = false,
   installTool?: Parameters<typeof DeviceService.makeWithHosts>[3],
+  extraHosts: ReadonlyArray<DeviceHost.DeviceHost["Service"]> = [],
 ) {
   const settings = yield* Ref.make(DEFAULT_SERVER_SETTINGS);
   const starts: string[] = [];
@@ -131,7 +133,7 @@ const fixture = Effect.fn("fixture")(function* (
     }),
   };
   const service = yield* DeviceService.makeWithHosts(
-    new Map([[host.id, host]]),
+    new Map([host, ...extraHosts].map((entry) => [entry.id, entry])),
     undefined,
     undefined,
     installTool,
@@ -308,6 +310,56 @@ describe("device setup consent", () => {
       // changed.
       yield* service.configure({ streamSource: "grpc-screenshot" });
       expect(starts.filter((event) => event === "stop")).toHaveLength(2);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("switching the capture source brings remote agent daemons back", () =>
+    Effect.gen(function* () {
+      const remoteAgentStarts: string[] = [];
+      const remoteId = DeviceHostId.make("ssh-1");
+      const remoteReady = {
+        nodePath: process.execPath,
+        hub: { origin: "http://remote.device.test" },
+        helpers: { serveSimAxSettings: null, serveSimCli: null },
+        run: () => Effect.succeed({ code: 0, stdout: "", stderr: "" }),
+        agentDevice: { baseUrl: "http://remote.agent.test", token: "test", entryPath: "/agent" },
+      };
+      const remote: DeviceHost.DeviceHost["Service"] = {
+        id: remoteId,
+        summary: Effect.succeed({
+          id: remoteId,
+          kind: "ssh",
+          label: "Remote",
+          platforms: [{ platform: "android", available: true }],
+          hubInstalled: true,
+          agentDeviceInstalled: true,
+        }),
+        platformAvailability: (platform) => Effect.succeed({ platform, available: true }),
+        ensureReady: () => Effect.succeed(remoteReady),
+        ensureAgentReady: () =>
+          Effect.sync(() => {
+            remoteAgentStarts.push("start");
+            return remoteReady;
+          }),
+        current: Effect.succeed(remoteReady),
+        stopAgent: Effect.void,
+        stop: Effect.void,
+      };
+      const { service } = yield* fixture(
+        Effect.void,
+        undefined,
+        false,
+        undefined,
+        false,
+        undefined,
+        [remote],
+      );
+      yield* service.configure({ enabled: true, agentAccessEnabled: true });
+      remoteAgentStarts.length = 0;
+
+      yield* service.configure({ streamSource: "scrcpy" });
+      // The stop took the remote daemon with it, and `list` only restores hubs.
+      expect(remoteAgentStarts).toHaveLength(1);
     }).pipe(Effect.scoped),
   );
 

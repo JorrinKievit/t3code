@@ -526,6 +526,7 @@ export const makeWithHosts = Effect.fn("DeviceService.makeWithHosts")(function* 
 
   const configure: DeviceService["Service"]["configure"] = Effect.fn("DeviceService.configure")(
     function* (input) {
+      const agentHostIds: DeviceHostId[] = [];
       // Everything a concurrent configure could change is read, written, and
       // published under one permit; a snapshot taken before the lock lets the
       // later call republish the values the earlier one just moved.
@@ -564,6 +565,16 @@ export const makeWithHosts = Effect.fn("DeviceService.makeWithHosts")(function* 
           // is stored: settings can also be written directly, and then the
           // running hubs are already on a source the setting no longer names.
           if (!nextEnabled || input.streamSource !== undefined) {
+            // Remote hosts are the ones `list` cannot speak for: it restores
+            // their hubs but not the agent daemons the stop takes with them.
+            // Note who is running one before stopping, so only those come back.
+            if (nextEnabled && input.streamSource !== undefined) {
+              for (const host of hosts.values()) {
+                if (host.id === LOCAL_DEVICE_HOST_ID) continue;
+                const running = yield* host.current;
+                if (running && "agentDevice" in running) agentHostIds.push(host.id);
+              }
+            }
             yield* Effect.forEach(hosts.values(), (host) => host.stop, { discard: true });
           } else if (input.agentAccessEnabled === false) {
             yield* Effect.forEach(hosts.values(), (host) => host.stopAgent, { discard: true });
@@ -596,6 +607,13 @@ export const makeWithHosts = Effect.fn("DeviceService.makeWithHosts")(function* 
         (input.agentAccessEnabled === true || restartedForSource)
       ) {
         yield* agentReadinessIfSupported();
+        // One unreachable remote host must not fail the switch; the failure is
+        // already on that host's status.
+        yield* Effect.forEach(
+          agentHostIds,
+          (hostId) => Effect.ignore(agentReadinessIfSupported(hostId)),
+          { discard: true },
+        );
       }
       return yield* list;
     },
