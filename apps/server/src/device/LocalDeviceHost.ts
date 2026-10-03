@@ -13,7 +13,6 @@ import { deviceToolInstallMessage } from "@t3tools/contracts";
  * prefix itself rather than from anything the hub prints.
  */
 import {
-  DEFAULT_DEVICE_STREAM_SOURCE,
   type DeviceHostSummary,
   type DevicePlatform,
   type DevicePlatformAvailability,
@@ -347,9 +346,19 @@ export const make = Effect.fn("LocalDeviceHost.make")(function* () {
     nodePath: string,
   ): Effect.fn.Return<HubProcess, DeviceHost.DeviceHostError> {
     yield* reapStaleHub;
+    // The hub takes the source at spawn and device state reports the stored
+    // one, so falling back to a default here would start a hub the panel then
+    // describes wrongly. Fail the start instead.
     const streamSource = yield* settings.getSettings.pipe(
       Effect.map((value) => value.deviceStreamSource),
-      Effect.orElseSucceed(() => DEFAULT_DEVICE_STREAM_SOURCE),
+      Effect.mapError(
+        (cause) =>
+          new DeviceHost.DeviceHostError({
+            hostId,
+            step: "reading the configured device video source",
+            cause,
+          }),
+      ),
     );
     yield* fs
       .makeDirectory(agentDeviceStateDir(path, config.stateDir), { recursive: true })

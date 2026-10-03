@@ -193,9 +193,18 @@ export const make = Effect.fn("SshDeviceHost.make")(function* (
     DeviceHost.DeviceHostError
   > {
     activated = true;
+    // Bootstrapping on a default the stored setting does not name would leave
+    // the panel describing a source the remote hub is not using.
     const streamSource = yield* settings.getSettings.pipe(
       Effect.map((value) => value.deviceStreamSource),
-      Effect.orElseSucceed(() => DEFAULT_DEVICE_STREAM_SOURCE),
+      Effect.mapError(
+        (cause) =>
+          new DeviceHost.DeviceHostError({
+            hostId: config.id,
+            step: "reading the configured device video source",
+            cause,
+          }),
+      ),
     );
     const result = yield* provide(
       bootstrap(config, owner, wantsAgent ? "agent-start" : "start", streamSource),
